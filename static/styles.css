@@ -306,11 +306,11 @@ body.viewer-open {
   width: 68px;
   height: 32px;
   border-radius: 999px;
-  background: linear-gradient(135deg, rgba(37, 99, 235, 0.85), rgba(59, 130, 246, 0.65));
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 4px;
+  border: 2px solid rgba(59, 130, 246, 0.35);
 }
 
 .order-toggle input {
@@ -326,6 +326,8 @@ body.viewer-open {
   width: 100%;
   height: 100%;
   border-radius: inherit;
+  background: linear-gradient(135deg, rgba(148, 163, 184, 0.35), rgba(148, 163, 184, 0.2));
+  transition: background 0.2s ease;
 }
 
 .order-handle {
@@ -336,12 +338,18 @@ body.viewer-open {
   height: 100%;
   border-radius: inherit;
   background: rgba(15, 23, 42, 0.88);
-  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.4);
-  transition: transform 0.25s ease;
+  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.35);
+  transition: transform 0.25s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.order-toggle input:checked + .order-slider {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.85), rgba(59, 130, 246, 0.65));
 }
 
 .order-toggle input:checked + .order-slider .order-handle {
   transform: translateX(100%);
+  background: #f8fafc;
+  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.45);
 }
 
 .order-switch.asc .order-text-right,
@@ -521,11 +529,11 @@ body.viewer-open {
   width: 58px;
   height: 30px;
   border-radius: 999px;
-  background: linear-gradient(135deg, rgba(37, 99, 235, 0.75), rgba(59, 130, 246, 0.6));
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 4px;
+  border: 2px solid rgba(59, 130, 246, 0.35);
 }
 
 .toggle-switch input {
@@ -541,6 +549,8 @@ body.viewer-open {
   width: 100%;
   height: 100%;
   border-radius: inherit;
+  background: linear-gradient(135deg, rgba(148, 163, 184, 0.35), rgba(148, 163, 184, 0.2));
+  transition: background 0.2s ease;
 }
 
 .toggle-handle {
@@ -552,11 +562,17 @@ body.viewer-open {
   border-radius: inherit;
   background: rgba(15, 23, 42, 0.88);
   box-shadow: 0 4px 10px rgba(15, 23, 42, 0.4);
-  transition: transform 0.25s ease;
+  transition: transform 0.25s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.75), rgba(59, 130, 246, 0.6));
 }
 
 .toggle-switch input:checked + .toggle-slider .toggle-handle {
   transform: translateX(100%);
+  background: #f8fafc;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.45);
 }
 
 .random-viewer-help {

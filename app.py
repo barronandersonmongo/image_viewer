@@ -279,20 +279,45 @@ def _extract_date_value(rel_path: Path) -> tuple[bool, int]:
 
 DATE_TOKEN_PATTERN = re.compile(r"(?P<year>(?:19|20)\d{2})(?P<sep>[-_/]?)(?P<month>\d{2})(?P=sep)?(?P<day>\d{2})")
 
-def format_display_date(label: str) -> Optional[str]:
-    normalized = label.strip()
+def _parse_date_label(text: str) -> Optional[datetime]:
+    normalized = (text or "").strip()
     if not normalized:
         return None
-    match = DATE_TOKEN_PATTERN.search(normalized)
-    if not match:
+
+    def build_date(year: int, month: int, day: int) -> Optional[datetime]:
+        try:
+            return datetime(year, month, day)
+        except ValueError:
+            return None
+
+    cleaned = normalized.replace("_", "-").replace("/", "-").replace(".", "-")
+    match = re.fullmatch(r"(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})", cleaned)
+    if match:
+        return build_date(int(match.group("year")), int(match.group("month")), int(match.group("day")))
+
+    digits = re.sub(r"\D", "", normalized)
+    if len(digits) >= 8:
+        year = int(digits[:4])
+        month = int(digits[4:6])
+        day = int(digits[6:8])
+        parsed = build_date(year, month, day)
+        if parsed:
+            return parsed
+
+    for fmt in ("%B %d %Y", "%b %d %Y", "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+
+    return None
+
+
+def format_display_date(label: str) -> Optional[str]:
+    date_obj = _parse_date_label(label)
+    if not date_obj:
         return None
-    try:
-        year = int(match.group("year"))
-        month = int(match.group("month"))
-        day = int(match.group("day"))
-        date_obj = datetime(year, month, day)
-    except ValueError:
-        return None
+    return f"{date_obj:%B} {date_obj.day}, {date_obj.year}"
 def sanitize_zip_component(component: str, fallback: str = "item") -> str:
     cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", component).strip()
     cleaned = cleaned.replace("\0", "_")

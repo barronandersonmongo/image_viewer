@@ -780,6 +780,7 @@ function createSpecificEntry(rawValue) {
         type: "year",
         year,
         label: `Year ${year}`,
+        raw,
       };
     }
   }
@@ -791,6 +792,7 @@ function createSpecificEntry(rawValue) {
       type: "date",
       iso,
       label: formatIsoDateFriendly(iso),
+      raw,
     };
   }
   const text = raw.toLowerCase();
@@ -801,6 +803,74 @@ function createSpecificEntry(rawValue) {
     raw,
     label: raw,
   };
+}
+
+function normalizeRandomViewerFilters() {
+  if (!state.randomViewer) {
+    state.randomViewer = {
+      enabled: false,
+      running: false,
+      timerId: null,
+      duration: 10,
+      blend: 1,
+      lastPath: null,
+      nextChoice: null,
+      pool: [],
+      filter: {
+        start: null,
+        end: null,
+        specificMap: new Map(),
+        specificList: [],
+      },
+    };
+  }
+  const filter = state.randomViewer.filter || {
+    start: null,
+    end: null,
+    specificMap: new Map(),
+    specificList: [],
+  };
+  if (!(filter.specificMap instanceof Map)) {
+    filter.specificMap = new Map();
+  }
+  const aggregate = [];
+  if (Array.isArray(filter.specificList)) {
+    aggregate.push(...filter.specificList);
+  } else if (filter.specificList) {
+    aggregate.push(filter.specificList);
+  }
+  filter.specificMap.forEach((entry) => aggregate.push(entry));
+
+  const map = new Map();
+  const normalized = [];
+  aggregate.forEach((item) => {
+    let entry = item;
+    if (typeof entry === "string") {
+      entry = createSpecificEntry(entry);
+    } else if (entry && typeof entry === "object" && entry.key) {
+      if (entry.type === "date" && entry.iso) {
+        entry.label = formatIsoDateFriendly(entry.iso);
+      } else if (entry.type === "year" && entry.year !== undefined) {
+        entry.label = entry.label || `Year ${entry.year}`;
+      } else if (entry.type === "text") {
+        entry.text = entry.text || (entry.raw ? entry.raw.toLowerCase() : "");
+        entry.label = entry.label || entry.raw || entry.text;
+      }
+      entry.raw = entry.raw || (entry.label || "");
+    } else {
+      entry = createSpecificEntry(String(item));
+    }
+    if (entry && entry.key && !map.has(entry.key)) {
+      map.set(entry.key, entry);
+      normalized.push(entry);
+    }
+  });
+
+  normalized.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
+  filter.specificMap = map;
+  filter.specificList = normalized;
+  state.randomViewer.filter = filter;
+  return filter;
 }
 
 function deriveDateValueFromItem(item) {
@@ -891,6 +961,7 @@ function updateRandomViewerSettingsAvailability() {
   if (!elements.randomViewerSettings) {
     return;
   }
+  normalizeRandomViewerFilters();
   elements.randomViewerSettings.removeAttribute("aria-hidden");
   if (elements.randomViewerSection) {
     elements.randomViewerSection.classList.toggle("random-viewer-active", state.randomViewer.running);
@@ -904,14 +975,19 @@ function updateRandomViewerSettingsAvailability() {
 }
 
 function buildRandomViewerPool() {
-  const filter = state.randomViewer.filter;
-  const specificEntries = filter.specificMap ? Array.from(filter.specificMap.values()) : [];
+  const filter = normalizeRandomViewerFilters();
+  const specificEntries = filter.specificList || [];
   const hasSpecific = specificEntries.length > 0;
   const hasRange = filter.start !== null || filter.end !== null;
   const pool = [];
   const topGroupMap = new Map();
+  const subgroupMap = new Map();
   state.topGroups.forEach((topGroup) => {
     topGroupMap.set(topGroup.key, topGroup);
+    const subgroups = Array.isArray(topGroup.subgroups) ? topGroup.subgroups : [];
+    subgroups.forEach((subgroup) => {
+      subgroupMap.set(subgroup.key, subgroup);
+    });
   });
 
   state.imagesByGroup.forEach((items, groupKey) => {
@@ -924,6 +1000,10 @@ function buildRandomViewerPool() {
         }
       }
       const isoValue = dateValue ? formatValueToDateString(dateValue) : null;
+      const subgroupMeta = subgroupMap.get(groupKey);
+      const subgroupLabel = subgroupMeta ? (subgroupMeta.formattedLabel || subgroupMeta.label || "") : "";
+      const topLabelMeta = topGroupMap.get(groupKey.split("/")[0] || "");
+      const topLabelText = topLabelMeta ? (topLabelMeta.formattedLabel || topLabelMeta.label || "") : "";
       const matchesSpecific = hasSpecific
         ? specificEntries.some((entry) => {
             if (entry.type === "date") {
@@ -948,6 +1028,12 @@ function buildRandomViewerPool() {
                 return true;
               }
               if (item.name && item.name.toLowerCase().includes(lowerTarget)) {
+                return true;
+              }
+              if (subgroupLabel && subgroupLabel.toLowerCase().includes(lowerTarget)) {
+                return true;
+              }
+              if (topLabelText && topLabelText.toLowerCase().includes(lowerTarget)) {
                 return true;
               }
               const topKey = groupKey.split("/")[0];
@@ -1095,6 +1181,7 @@ async function runRandomViewerCycle() {
 }
 
 function startRandomViewer() {
+  normalizeRandomViewerFilters();
   if (elements.randomViewerDuration) {
     const currentValue = Number.parseInt(elements.randomViewerDuration.value, 10);
     if (Number.isFinite(currentValue) && currentValue >= 1) {
@@ -1169,9 +1256,10 @@ function renderRandomViewerChips() {
   if (!elements.randomViewerDateChips) {
     return;
   }
+  const filter = normalizeRandomViewerFilters();
   const container = elements.randomViewerDateChips;
   container.innerHTML = "";
-  const list = state.randomViewer.filter.specificList || [];
+  const list = filter.specificList || [];
   if (!list.length) {
     return;
   }
@@ -1197,7 +1285,7 @@ function renderRandomViewerChips() {
 }
 
 function removeRandomViewerSpecificDate(key) {
-  const filter = state.randomViewer.filter;
+  const filter = normalizeRandomViewerFilters();
   if (!filter || !filter.specificMap) {
     return;
   }
@@ -1228,7 +1316,7 @@ function addRandomViewerSpecificDate() {
     alert("Please enter a valid value (date, year, or text).");
     return;
   }
-  const filter = state.randomViewer.filter;
+  const filter = normalizeRandomViewerFilters();
   if (filter.specificMap.has(entry.key)) {
     input.value = "";
     return;
