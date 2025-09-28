@@ -13,13 +13,11 @@ import re
 import time
 import zipfile
 from datetime import datetime
-from functools import lru_cache
 from http import HTTPStatus
 import http.server
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
-import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageOps
 
@@ -281,26 +279,6 @@ def _extract_date_value(rel_path: Path) -> tuple[bool, int]:
 
 DATE_TOKEN_PATTERN = re.compile(r"(?P<year>(?:19|20)\d{2})(?P<sep>[-_/]?)(?P<month>\d{2})(?P=sep)?(?P<day>\d{2})")
 
-COUNTRY_CODE_MAP = {
-    "US": "United States of America",
-    "USA": "United States of America",
-    "U.S.": "United States of America",
-    "U.S.A.": "United States of America",
-    "GB": "United Kingdom",
-    "UK": "United Kingdom",
-    "CA": "Canada",
-}
-
-US_NAMES = {
-    "usa",
-    "us",
-    "u.s.",
-    "u.s.a.",
-    "united states",
-    "united states of america",
-}
-
-
 def format_display_date(label: str) -> Optional[str]:
     normalized = label.strip()
     if not normalized:
@@ -315,124 +293,6 @@ def format_display_date(label: str) -> Optional[str]:
         date_obj = datetime(year, month, day)
     except ValueError:
         return None
-    formatted = date_obj.strftime("%B %d, %Y")
-    return formatted.replace(" 0", " ")
-
-
-def _local_name(tag: str) -> str:
-    if "}" in tag:
-        return tag.split("}", 1)[1]
-    return tag
-
-
-def _decode_utf16(value: bytes) -> str:
-    try:
-        decoded = value.decode("utf-16le", errors="ignore")
-        return decoded.rstrip("\x00")
-    except Exception:
-        return ""
-
-
-def _extract_location_from_xmp(xmp_blob: object) -> Dict[str, str]:
-    if not xmp_blob:
-        return {}
-    if isinstance(xmp_blob, bytes):
-        data = xmp_blob.decode("utf-8", errors="ignore")
-    else:
-        data = str(xmp_blob)
-    try:
-        root = ET.fromstring(data)
-    except ET.ParseError:
-        return {}
-
-    location: Dict[str, str] = {}
-    for element in root.iter():
-        text = (element.text or "").strip()
-        if not text:
-            continue
-        name = _local_name(element.tag).lower()
-        if name == "city" and "city" not in location:
-            location["city"] = text
-        elif name in {"state", "provincestate", "province"} and "state" not in location:
-            location["state"] = text
-        elif name in {"country", "countryname"} and "country" not in location:
-            location["country"] = text
-        elif name == "countrycode" and "country" not in location:
-            location["country"] = COUNTRY_CODE_MAP.get(text.upper(), text)
-    return location
-
-
-def _extract_location_from_exif(image_obj: Image.Image) -> Dict[str, str]:
-    try:
-        exif = image_obj.getexif()
-    except Exception:
-        return {}
-    if not exif:
-        return {}
-    location: Dict[str, str] = {}
-    for key, value in exif.items():
-        if key in {0x9C9B, 0x9C9E, 0x9C9F}:  # XPTitle, XPKeywords, XPSubject
-            if isinstance(value, bytes):
-                text = _decode_utf16(value)
-            else:
-                text = str(value)
-            for part in re.split(r";|,", text):
-                cleaned = part.strip()
-                if not cleaned:
-                    continue
-                lowered = cleaned.lower()
-                if "city" not in location and lowered.startswith("city:"):
-                    location["city"] = cleaned.split(":", 1)[1].strip()
-                elif "state" not in location and lowered.startswith("state:"):
-                    location["state"] = cleaned.split(":", 1)[1].strip()
-                elif "country" not in location and lowered.startswith("country:"):
-                    location["country"] = cleaned.split(":", 1)[1].strip()
-    return location
-
-
-def _build_location_label(location: Dict[str, str]) -> Optional[str]:
-    if not location:
-        return None
-    city = location.get("city", "").strip()
-    state = location.get("state", "").strip()
-    country = location.get("country", "").strip()
-    if country.upper() in COUNTRY_CODE_MAP:
-        country = COUNTRY_CODE_MAP[country.upper()]
-    country_lower = country.lower()
-    is_us = country_lower in US_NAMES if country_lower else False
-
-    parts: List[str] = []
-    if city:
-        parts.append(city)
-    if state:
-        parts.append(state)
-    if country and (not is_us or not state):
-        parts.append(country)
-    if not parts:
-        return None
-    return ", ".join(parts)
-
-
-@lru_cache(maxsize=512)
-def extract_location_details(image_path: str) -> Optional[Dict[str, str]]:
-    path = Path(image_path)
-    if not path.exists() or not path.is_file():
-        return None
-    try:
-        with Image.open(path) as image:
-            location = _extract_location_from_xmp(image.info.get("XML:com.adobe.xmp"))
-            if not location and "xmp" in image.info:
-                location = _extract_location_from_xmp(image.info.get("xmp"))
-            if not location:
-                location = _extract_location_from_exif(image)
-            label = _build_location_label(location)
-            if label:
-                return {"label": label, **{k: v for k, v in location.items() if v}}
-    except Exception:
-        return None
-    return None
-
-
 def sanitize_zip_component(component: str, fallback: str = "item") -> str:
     cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", component).strip()
     cleaned = cleaned.replace("\0", "_")
@@ -616,31 +476,13 @@ def build_hierarchy(root: Path) -> Dict[str, object]:
         subgroups_list: List[Dict[str, object]] = []
         for sub in subgroups_raw:
             formatted_label = format_display_date(sub["label"]) or sub["label"]
-            location_label = None
-            location_details: Optional[Dict[str, str]] = None
-            images_for_group = images_by_group.get(sub["key"], [])
-            first_image = images_for_group[0]["path"] if images_for_group else None
-            if first_image:
-                absolute = (root / first_image).resolve()
-                info = extract_location_details(str(absolute))
-                if info:
-                    location_details = info
-                    location_label = info.get("label")
-
             subgroup_payload: Dict[str, object] = {
                 "key": sub["key"],
                 "label": sub["label"],
                 "formattedLabel": formatted_label,
                 "count": sub["count"],
                 "dateValue": sub["maxDate"],
-                "firstImagePath": first_image,
             }
-            if location_label:
-                subgroup_payload["location"] = location_label
-            if location_details:
-                subgroup_payload["locationDetails"] = {
-                    key: value for key, value in location_details.items() if key != "label"
-                }
             subgroups_list.append(subgroup_payload)
         subgroups_list.sort(
             key=lambda item: (item["dateValue"], item["key"]), reverse=True
