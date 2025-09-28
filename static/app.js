@@ -39,6 +39,20 @@ const state = {
     groupSelections: new Set(),
     inProgress: false,
   },
+  randomViewer: {
+    enabled: false,
+    running: false,
+    timerId: null,
+    duration: 10,
+    lastPath: null,
+    pool: [],
+    filter: {
+      start: null,
+      end: null,
+      specific: new Set(),
+      specificList: [],
+    },
+  },
 };
 
 const elements = {
@@ -73,6 +87,15 @@ const elements = {
   downloadCount: document.getElementById("downloadCount"),
   downloadButton: document.getElementById("downloadButton"),
   downloadClear: document.getElementById("downloadClear"),
+  randomViewerSection: document.getElementById("randomViewerSection"),
+  randomViewerToggle: document.getElementById("randomViewerToggle"),
+  randomViewerSettings: document.getElementById("randomViewerSettings"),
+  randomViewerDuration: document.getElementById("randomViewerDuration"),
+  randomViewerStart: document.getElementById("randomViewerStart"),
+  randomViewerEnd: document.getElementById("randomViewerEnd"),
+  randomViewerSpecificInput: document.getElementById("randomViewerSpecificInput"),
+  randomViewerAddDate: document.getElementById("randomViewerAddDate"),
+  randomViewerDateChips: document.getElementById("randomViewerDateChips"),
 };
 
 function fetchJson(url) {
@@ -615,6 +638,296 @@ async function handleDownloadButtonClick(event) {
   await initiateDownload();
 }
 
+function parseDateToValue(dateString) {
+  if (!dateString) {
+    return null;
+  }
+  const parts = dateString.split("-");
+  if (parts.length !== 3) {
+    return null;
+  }
+  const [year, month, day] = parts.map((part) => Number.parseInt(part, 10));
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    return null;
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    return null;
+  }
+  return year * 10000 + month * 100 + day;
+}
+
+function formatValueToDateString(value) {
+  if (!Number.isInteger(value) || value <= 0) {
+    return "";
+  }
+  const year = Math.floor(value / 10000);
+  const month = Math.floor((value % 10000) / 100);
+  const day = value % 100;
+  return `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-${day
+    .toString()
+    .padStart(2, "0")}`;
+}
+
+function clearRandomViewerTimer() {
+  if (state.randomViewer.timerId) {
+    clearTimeout(state.randomViewer.timerId);
+    state.randomViewer.timerId = null;
+  }
+}
+
+function stopRandomViewer({ resetToggle = true } = {}) {
+  clearRandomViewerTimer();
+  state.randomViewer.running = false;
+  state.randomViewer.enabled = false;
+  state.randomViewer.lastPath = null;
+  state.randomViewer.pool = [];
+  if (resetToggle && elements.randomViewerToggle) {
+    elements.randomViewerToggle.checked = false;
+  }
+  updateRandomViewerSettingsAvailability();
+}
+
+function updateRandomViewerSettingsAvailability() {
+  if (!elements.randomViewerSettings) {
+    return;
+  }
+  elements.randomViewerSettings.setAttribute("aria-hidden", "false");
+  if (elements.randomViewerSection) {
+    elements.randomViewerSection.classList.toggle("random-viewer-active", state.randomViewer.running);
+  }
+  if (elements.randomViewerDuration) {
+    elements.randomViewerDuration.value = String(state.randomViewer.duration);
+  }
+}
+
+function buildRandomViewerPool() {
+  const filter = state.randomViewer.filter;
+  const specificSet = filter.specific;
+  const hasSpecific = specificSet && specificSet.size > 0;
+  const hasRange = filter.start !== null || filter.end !== null;
+  const pool = [];
+
+  state.imagesByGroup.forEach((items, groupKey) => {
+    items.forEach((item) => {
+      const dateValue = Number.isInteger(item.dateValue) ? item.dateValue : null;
+      const matchesSpecific = hasSpecific && dateValue !== null && specificSet.has(dateValue);
+      let matchesRange = true;
+      if (hasRange) {
+        if (dateValue === null) {
+          matchesRange = false;
+        } else {
+          if (filter.start !== null && dateValue < filter.start) {
+            matchesRange = false;
+          }
+          if (filter.end !== null && dateValue > filter.end) {
+            matchesRange = false;
+          }
+        }
+      }
+      const include = hasSpecific
+        ? matchesSpecific || (hasRange ? matchesRange : false)
+        : hasRange
+        ? matchesRange
+        : true;
+      if (!include) {
+        return;
+      }
+      if (!item.path) {
+        return;
+      }
+      pool.push({ path: item.path, groupKey });
+    });
+  });
+
+  state.randomViewer.pool = pool;
+  return pool;
+}
+
+function refreshRandomViewerPool() {
+  return buildRandomViewerPool();
+}
+
+function scheduleRandomViewerTick() {
+  clearRandomViewerTimer();
+  if (!state.randomViewer.running) {
+    return;
+  }
+  state.randomViewer.timerId = setTimeout(() => {
+    runRandomViewerCycle();
+  }, Math.max(1, state.randomViewer.duration) * 1000);
+}
+
+async function runRandomViewerCycle() {
+  if (!state.randomViewer.running) {
+    return;
+  }
+  if (!state.randomViewer.pool.length) {
+    const pool = refreshRandomViewerPool();
+    if (!pool.length) {
+      alert("No images match the current random viewer filters.");
+      stopRandomViewer();
+      return;
+    }
+  }
+  const pool = state.randomViewer.pool;
+  let attempt = 0;
+  let choice = null;
+  while (attempt < pool.length) {
+    const candidate = pool[Math.floor(Math.random() * pool.length)];
+    if (!candidate) {
+      attempt += 1;
+      continue;
+    }
+    if (candidate.path !== state.randomViewer.lastPath || pool.length === 1) {
+      choice = candidate;
+      break;
+    }
+    attempt += 1;
+  }
+  if (!choice) {
+    choice = pool[0];
+  }
+  if (!choice) {
+    stopRandomViewer();
+    return;
+  }
+
+  if (!state.randomViewer.running) {
+    return;
+  }
+
+  try {
+    await openImageByPath(choice.path);
+    state.randomViewer.lastPath = choice.path;
+  } catch (error) {
+    console.error("Random viewer failed to open image", error);
+  }
+
+  if (state.randomViewer.running) {
+    scheduleRandomViewerTick();
+  }
+}
+
+function startRandomViewer() {
+  if (elements.randomViewerDuration) {
+    const currentValue = Number.parseInt(elements.randomViewerDuration.value, 10);
+    if (Number.isFinite(currentValue) && currentValue >= 1) {
+      state.randomViewer.duration = currentValue;
+    }
+  }
+  const pool = refreshRandomViewerPool();
+  if (!pool.length) {
+    alert("No images match the current filters for the random viewer.");
+    stopRandomViewer({ resetToggle: true });
+    return;
+  }
+  state.randomViewer.enabled = true;
+  state.randomViewer.running = true;
+  state.randomViewer.lastPath = null;
+  updateRandomViewerSettingsAvailability();
+  runRandomViewerCycle();
+}
+
+function handleRandomViewerToggle(event) {
+  const enabled = Boolean(event.target.checked);
+  if (enabled) {
+    startRandomViewer();
+  } else {
+    stopRandomViewer({ resetToggle: false });
+  }
+}
+
+function updateRandomViewerDuration(event) {
+  const value = Number.parseInt(event.target.value, 10);
+  if (!Number.isFinite(value) || value < 1) {
+    return;
+  }
+  state.randomViewer.duration = value;
+  if (state.randomViewer.running) {
+    scheduleRandomViewerTick();
+  }
+}
+
+function updateRandomViewerRange() {
+  const startValue = parseDateToValue(elements.randomViewerStart ? elements.randomViewerStart.value : "");
+  const endValue = parseDateToValue(elements.randomViewerEnd ? elements.randomViewerEnd.value : "");
+  state.randomViewer.filter.start = startValue;
+  state.randomViewer.filter.end = endValue;
+  refreshRandomViewerPool();
+  if (state.randomViewer.running) {
+    scheduleRandomViewerTick();
+  }
+}
+
+function renderRandomViewerChips() {
+  if (!elements.randomViewerDateChips) {
+    return;
+  }
+  const container = elements.randomViewerDateChips;
+  container.innerHTML = "";
+  const list = state.randomViewer.filter.specificList || [];
+  if (!list.length) {
+    return;
+  }
+  list.forEach((value) => {
+    const wrapper = document.createElement("span");
+    wrapper.className = "date-chip";
+    wrapper.dataset.value = String(value);
+    wrapper.textContent = formatValueToDateString(value);
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.setAttribute("aria-label", `Remove ${wrapper.textContent}`);
+    removeButton.textContent = "×";
+    removeButton.addEventListener("click", () => {
+      removeRandomViewerSpecificDate(value);
+    });
+    wrapper.appendChild(removeButton);
+    container.appendChild(wrapper);
+  });
+}
+
+function removeRandomViewerSpecificDate(value) {
+  const set = state.randomViewer.filter.specific;
+  if (!set.has(value)) {
+    return;
+  }
+  set.delete(value);
+  state.randomViewer.filter.specificList = state.randomViewer.filter.specificList.filter(
+    (item) => item !== value,
+  );
+  renderRandomViewerChips();
+  refreshRandomViewerPool();
+  if (state.randomViewer.running) {
+    scheduleRandomViewerTick();
+  }
+}
+
+function addRandomViewerSpecificDate() {
+  const input = elements.randomViewerSpecificInput;
+  if (!input) {
+    return;
+  }
+  const value = parseDateToValue(input.value);
+  if (!value) {
+    alert("Please choose a valid date to add.");
+    return;
+  }
+  const set = state.randomViewer.filter.specific;
+  if (set.has(value)) {
+    input.value = "";
+    return;
+  }
+  set.add(value);
+  state.randomViewer.filter.specificList.push(value);
+  state.randomViewer.filter.specificList.sort((a, b) => a - b);
+  input.value = "";
+  renderRandomViewerChips();
+  refreshRandomViewerPool();
+  if (state.randomViewer.running) {
+    scheduleRandomViewerTick();
+  }
+}
+
 function selectComboboxOption(option) {
   if (!option) {
     return;
@@ -770,6 +1083,7 @@ function updateOrderUI() {
 
 function resetStateForOrder() {
   resetDownloadState();
+  stopRandomViewer({ resetToggle: true });
   state.groups.clear();
   state.groupSequence = [];
   state.groupIndexMap.clear();
@@ -799,6 +1113,8 @@ function resetStateForOrder() {
   if (elements.yearNavigation) {
     elements.yearNavigation.hidden = true;
   }
+  renderRandomViewerChips();
+  updateRandomViewerSettingsAvailability();
   if (elements.searchCombobox) {
     elements.searchCombobox.setAttribute("aria-expanded", "false");
   }
@@ -825,6 +1141,7 @@ async function fetchHierarchy() {
     state.imagesByGroup = new Map(
       Object.entries(imagesByGroup).map(([key, list]) => [key, Array.isArray(list) ? list : []]),
     );
+    refreshRandomViewerPool();
     state.topGroups = Array.isArray(data.groups) ? data.groups : [];
     buildTopGroupOptions(state.topGroups);
     renderNextTopGroups(GROUP_BATCH_SIZE);
@@ -1472,6 +1789,9 @@ function closeViewer() {
       setHeaderCollapsed(true);
     }
   }
+  if (state.randomViewer.running) {
+    stopRandomViewer({ resetToggle: true });
+  }
   updateUrlWithImage(null);
   if (state.activeThumb) {
     state.activeThumb.classList.remove("active");
@@ -1493,11 +1813,19 @@ function renderViewer() {
     return;
   }
   showViewerLoading();
+  if (elements.viewerImage) {
+    elements.viewerImage.style.opacity = "0";
+  }
   elements.viewerImage.src = `/api/image?path=${encodeURIComponent(item.path)}`;
   elements.viewerImage.alt = item.name;
   const finalize = () => {
     updateViewerMetadata(groupState, item);
     highlightActiveThumbnail(item);
+    requestAnimationFrame(() => {
+      if (elements.viewerImage) {
+        elements.viewerImage.style.opacity = "1";
+      }
+    });
     elements.viewerImage.removeEventListener("load", finalize);
     elements.viewerImage.removeEventListener("error", handleError);
   };
@@ -1509,6 +1837,9 @@ function renderViewer() {
     highlightActiveThumbnail(item);
     if (elements.viewerContainer) {
       elements.viewerContainer.classList.remove("portrait");
+    }
+    if (elements.viewerImage) {
+      elements.viewerImage.style.opacity = "1";
     }
     elements.viewerImage.removeEventListener("load", finalize);
     elements.viewerImage.removeEventListener("error", handleError);
@@ -1545,6 +1876,9 @@ function showViewerLoading() {
     elements.viewerContainer.classList.remove("portrait");
   }
   resetViewerTransform();
+  if (elements.viewerImage) {
+    elements.viewerImage.style.opacity = "0";
+  }
   setInfoBar(elements.viewerInfoTop, "Loading image…", "block");
   setInfoBar(elements.viewerInfoBottom, "", "block");
   setInfoBar(elements.viewerInfoLeft, "", "block");
@@ -1862,6 +2196,36 @@ if (elements.downloadButton) {
   elements.downloadButton.addEventListener("click", handleDownloadButtonClick);
 }
 
+if (elements.randomViewerToggle) {
+  elements.randomViewerToggle.addEventListener("change", handleRandomViewerToggle);
+}
+
+if (elements.randomViewerDuration) {
+  elements.randomViewerDuration.addEventListener("change", updateRandomViewerDuration);
+  elements.randomViewerDuration.addEventListener("input", updateRandomViewerDuration);
+}
+
+if (elements.randomViewerStart) {
+  elements.randomViewerStart.addEventListener("change", updateRandomViewerRange);
+}
+
+if (elements.randomViewerEnd) {
+  elements.randomViewerEnd.addEventListener("change", updateRandomViewerRange);
+}
+
+if (elements.randomViewerAddDate) {
+  elements.randomViewerAddDate.addEventListener("click", addRandomViewerSpecificDate);
+}
+
+if (elements.randomViewerSpecificInput) {
+  elements.randomViewerSpecificInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addRandomViewerSpecificDate();
+    }
+  });
+}
+
 if (elements.orderToggle) {
   elements.orderToggle.addEventListener("change", () => {
     const nextOrder = elements.orderToggle.checked ? "asc" : "desc";
@@ -2089,6 +2453,8 @@ document.addEventListener("click", (event) => {
 });
 
 updateDownloadControls();
+updateRandomViewerSettingsAvailability();
+renderRandomViewerChips();
 
 setupViewerGestures();
 
@@ -2112,8 +2478,14 @@ document.addEventListener("keydown", async (event) => {
     return;
   }
   if (event.key === "ArrowRight") {
+    if (state.randomViewer.running) {
+      return;
+    }
     await showNext();
   } else if (event.key === "ArrowLeft") {
+    if (state.randomViewer.running) {
+      return;
+    }
     await showPrevious();
   }
 });

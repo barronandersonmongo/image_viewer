@@ -49,6 +49,42 @@
           </div>
           <p class="download-hint">Tip: hold Ctrl (or ⌘) while clicking a thumbnail to add it without leaving viewer mode.</p>
         </div>
+        <section class="random-viewer" id="randomViewerSection">
+          <header class="random-viewer-header">
+            <div class="random-viewer-toggle">
+              <input type="checkbox" id="randomViewerToggle" aria-describedby="randomViewerHelp">
+              <label for="randomViewerToggle">Random image viewer</label>
+            </div>
+            <p class="random-viewer-help" id="randomViewerHelp">Cycle through photos automatically like a digital frame.</p>
+          </header>
+          <div class="random-viewer-settings" id="randomViewerSettings" aria-hidden="true">
+            <div class="random-setting">
+              <label for="randomViewerDuration">Display time (seconds)</label>
+              <input type="number" id="randomViewerDuration" min="3" max="300" step="1" value="10">
+            </div>
+            <div class="random-setting random-dates">
+              <fieldset>
+                <legend>Date range</legend>
+                <div class="date-range-inputs">
+                  <label for="randomViewerStart">From</label>
+                  <input type="date" id="randomViewerStart">
+                  <label for="randomViewerEnd">To</label>
+                  <input type="date" id="randomViewerEnd">
+                </div>
+              </fieldset>
+            </div>
+            <div class="random-setting random-specific-dates">
+              <fieldset>
+                <legend>Specific dates</legend>
+                <div class="specific-date-input">
+                  <input type="date" id="randomViewerSpecificInput">
+                  <button type="button" id="randomViewerAddDate">Add date</button>
+                </div>
+                <div class="specific-date-chips" id="randomViewerDateChips" aria-live="polite"></div>
+              </fieldset>
+            </div>
+          </div>
+        </section>
       </div>
     </header>
     <main class="timeline" id="timeline">

@@ -545,6 +545,7 @@ def hierarchy_payload(root: Path, order: str) -> Dict[str, object]:
                 "name": item.get("name"),
                 "path": item.get("path"),
                 "dateHint": item.get("dateHint"),
+                "dateValue": item.get("dateValue"),
             }
             for item in sequence
         ]
