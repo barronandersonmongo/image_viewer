@@ -116,6 +116,44 @@ body.viewer-open {
   color: #f1f5f9;
 }
 
+.flyout-pin {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(148, 163, 184, 0.16);
+  color: rgba(226, 232, 240, 0.92);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+
+.flyout-pin .pin-icon {
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.flyout-pin:hover,
+.flyout-pin:focus-visible {
+  background: rgba(96, 165, 250, 0.2);
+  border-color: rgba(191, 219, 254, 0.7);
+  outline: none;
+}
+
+.flyout-pin.active {
+  background: rgba(37, 99, 235, 0.75);
+  border-color: rgba(191, 219, 254, 0.9);
+  color: #f8fafc;
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.4);
+}
+
+.app-header.collapsed .flyout-pin {
+  display: none;
+}
+
 .app-header.collapsed .header-bar h1 {
   display: none;
 }
@@ -419,32 +457,27 @@ body.viewer-open {
   }
 }
 
-.download-controls {
+
+.download-bar {
   display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 16px;
-  border-radius: 16px;
-  border: 1px solid rgba(59, 130, 246, 0.28);
-  background: rgba(15, 23, 42, 0.52);
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 18px;
 }
 
-.download-controls.is-active {
-  border-color: rgba(96, 165, 250, 0.6);
-  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.25);
+.download-bar .download-row,
+.download-bar .download-action-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
-.download-controls.has-selection {
-  border-color: rgba(191, 219, 254, 0.65);
-}
-
-.download-controls.is-busy {
-  opacity: 0.85;
-}
-
-.download-controls.has-selection .download-count {
-  color: rgba(224, 231, 255, 0.98);
+.download-bar .download-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: rgba(148, 163, 184, 0.8);
 }
 
 .random-viewer {
@@ -455,6 +488,8 @@ body.viewer-open {
   border-radius: 18px;
   border: 1px solid rgba(71, 85, 105, 0.45);
   background: rgba(15, 23, 42, 0.45);
+  width: min(100%, 520px);
+  align-self: flex-start;
 }
 
 .random-viewer.random-viewer-active {
@@ -471,15 +506,57 @@ body.viewer-open {
 .random-viewer-toggle {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-weight: 600;
-  color: rgba(226, 232, 240, 0.92);
+  gap: 12px;
 }
 
-.random-viewer-toggle input[type="checkbox"] {
-  width: 20px;
-  height: 20px;
-  accent-color: #2563eb;
+.random-viewer-label {
+  font-weight: 600;
+  color: rgba(226, 232, 240, 0.92);
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.toggle-switch {
+  position: relative;
+  width: 58px;
+  height: 30px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.75), rgba(59, 130, 246, 0.6));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+}
+
+.toggle-switch input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.toggle-slider {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+}
+
+.toggle-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 50%;
+  height: 100%;
+  border-radius: inherit;
+  background: rgba(15, 23, 42, 0.88);
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.4);
+  transition: transform 0.25s ease;
+}
+
+.toggle-switch input:checked + .toggle-slider .toggle-handle {
+  transform: translateX(100%);
 }
 
 .random-viewer-help {
@@ -489,15 +566,11 @@ body.viewer-open {
 }
 
 .random-viewer-settings {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 16px;
   transition: opacity 0.2s ease;
-}
-
-.random-viewer-settings[aria-hidden="true"] {
-  opacity: 0.4;
-  pointer-events: none;
+  width: 100%;
 }
 
 .random-setting {
@@ -514,16 +587,31 @@ body.viewer-open {
 }
 
 .random-setting input[type="number"],
-.random-setting input[type="date"] {
+.random-setting input[type="date"],
+.random-setting input[type="text"] {
   padding: 8px 10px;
   border-radius: 10px;
   border: 2px solid rgba(59, 130, 246, 0.45);
   background: #0f172a;
   color: #f8fafc;
+  width: 100%;
+}
+
+.random-setting input[type="number"] {
+  max-width: 160px;
+}
+
+.random-setting input[type="date"] {
+  max-width: 220px;
+}
+
+.random-setting input[type="text"] {
+  max-width: 260px;
 }
 
 .random-setting input[type="number"]:focus,
-.random-setting input[type="date"]:focus {
+.random-setting input[type="date"]:focus,
+.random-setting input[type="text"]:focus {
   border-color: rgba(96, 165, 250, 0.85);
   outline: none;
 }
@@ -532,11 +620,12 @@ body.viewer-open {
   border: 1px solid rgba(71, 85, 105, 0.5);
   border-radius: 12px;
   padding: 10px 12px 14px;
+  width: 100%;
 }
 
 .date-range-inputs {
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: auto minmax(140px, 1fr);
   gap: 6px 10px;
   align-items: center;
 }
@@ -548,9 +637,10 @@ body.viewer-open {
   flex-wrap: wrap;
 }
 
-.specific-date-input input[type="date"] {
-  flex: 1 1 160px;
-  min-width: 140px;
+.specific-date-input input[type="text"] {
+  flex: 1 1 200px;
+  min-width: 180px;
+  max-width: 260px;
 }
 
 .specific-date-input button {
@@ -562,6 +652,7 @@ body.viewer-open {
   font-weight: 600;
   cursor: pointer;
   transition: background 0.2s ease, border-color 0.2s ease;
+  white-space: nowrap;
 }
 
 .specific-date-input button:hover,
@@ -703,10 +794,6 @@ body.viewer-open {
   .download-action {
     width: 100%;
     text-align: center;
-  }
-
-  .random-viewer-settings {
-    grid-template-columns: 1fr;
   }
 }
 
@@ -1085,13 +1172,32 @@ body.viewer-open {
   padding-bottom: calc(60px + env(safe-area-inset-bottom));
 }
 
-.viewer-stage img {
+.viewer-image-stack {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+}
+
+.viewer-image {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
   display: block;
-  transition: opacity 0.5s ease;
   opacity: 1;
+}
+
+.viewer-image-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .viewer-info-bar {
@@ -1205,6 +1311,13 @@ body.viewer-open {
 .viewer-nav.next {
   right: 28px;
   right: calc(28px + env(safe-area-inset-right));
+}
+
+.viewer-nav:disabled,
+.viewer-nav.disabled {
+  opacity: 0.35;
+  cursor: default;
+  pointer-events: none;
 }
 
 .viewer-container.portrait .viewer-nav.prev {

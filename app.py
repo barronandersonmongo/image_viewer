@@ -487,10 +487,12 @@ def build_hierarchy(root: Path) -> Dict[str, object]:
         subgroups_list.sort(
             key=lambda item: (item["dateValue"], item["key"]), reverse=True
         )
+        formatted_top_label = format_display_date(top_entry["label"]) or top_entry["label"]
         top_group_list.append(
             {
                 "key": top_entry["key"],
                 "label": top_entry["label"],
+                "formattedLabel": formatted_top_label,
                 "count": top_entry["count"],
                 "dateValue": top_entry["maxDate"],
                 "subgroups": subgroups_list,
@@ -531,6 +533,7 @@ def hierarchy_payload(root: Path, order: str) -> Dict[str, object]:
             {
                 "key": group["key"],
                 "label": group["label"],
+                "formattedLabel": group.get("formattedLabel"),
                 "count": group["count"],
                 "dateValue": group["dateValue"],
                 "subgroups": subgroups_ordered,

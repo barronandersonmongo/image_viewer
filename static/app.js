@@ -28,6 +28,7 @@ const state = {
     open: false,
     groupKey: null,
     index: -1,
+    pendingBlend: 0,
   },
   initialImagePath: initialImageParam,
   activeThumb: null,
@@ -44,15 +45,18 @@ const state = {
     running: false,
     timerId: null,
     duration: 10,
+    blend: 1,
     lastPath: null,
+    nextChoice: null,
     pool: [],
     filter: {
       start: null,
       end: null,
-      specific: new Set(),
+      specificMap: new Map(),
       specificList: [],
     },
   },
+  flyoutPinned: false,
 };
 
 const elements = {
@@ -63,6 +67,7 @@ const elements = {
   viewerOverlay: document.getElementById("viewerOverlay"),
   viewerContainer: document.getElementById("viewerContainer"),
   viewerImage: document.getElementById("viewerImage"),
+  viewerImageOverlay: document.getElementById("viewerImageOverlay"),
   viewerInfoTop: document.getElementById("viewerInfoTop"),
   viewerInfoBottom: document.getElementById("viewerInfoBottom"),
   viewerInfoLeft: document.getElementById("viewerInfoLeft"),
@@ -91,11 +96,13 @@ const elements = {
   randomViewerToggle: document.getElementById("randomViewerToggle"),
   randomViewerSettings: document.getElementById("randomViewerSettings"),
   randomViewerDuration: document.getElementById("randomViewerDuration"),
+  randomViewerBlend: document.getElementById("randomViewerBlend"),
   randomViewerStart: document.getElementById("randomViewerStart"),
   randomViewerEnd: document.getElementById("randomViewerEnd"),
   randomViewerSpecificInput: document.getElementById("randomViewerSpecificInput"),
   randomViewerAddDate: document.getElementById("randomViewerAddDate"),
   randomViewerDateChips: document.getElementById("randomViewerDateChips"),
+  flyoutPin: document.getElementById("flyoutPin"),
 };
 
 function fetchJson(url) {
@@ -231,7 +238,7 @@ function renderYearNavigation(options = []) {
 function buildTopGroupOptions(groups) {
   const options = (Array.isArray(groups) ? groups : []).map((group) => ({
     key: group.key,
-    label: group.label,
+    label: group.formattedLabel || group.label,
     count: group.count || 0,
     dateValue: typeof group.dateValue === "number" ? group.dateValue : 0,
   }));
@@ -367,7 +374,7 @@ function updateGroupSelectionStatus(groupKey) {
     groupState.selectButton.classList.toggle("selected", fullySelected);
     groupState.selectButton.setAttribute("aria-pressed", fullySelected ? "true" : "false");
     if (!groupState.selectButton.disabled) {
-      groupState.selectButton.textContent = fullySelected ? "Deselect date" : "Select date";
+      groupState.selectButton.textContent = fullySelected ? "Deselect group" : "Select group";
     }
   }
   if (groupState.container) {
@@ -386,11 +393,6 @@ function updateGroupSelectionStatus(groupKey) {
 
 function updateDownloadControls() {
   const selectedCount = state.download.items.size;
-  if (elements.downloadControls) {
-    elements.downloadControls.classList.toggle("has-selection", selectedCount > 0);
-    elements.downloadControls.classList.toggle("is-busy", state.download.inProgress);
-    elements.downloadControls.classList.toggle("is-active", state.download.active);
-  }
   if (elements.downloadCount) {
     if (selectedCount > 0) {
       elements.downloadCount.textContent = `${selectedCount.toLocaleString()} selected`;
@@ -448,7 +450,7 @@ function resetDownloadState({ keepMode = false } = {}) {
       groupState.selectButton.classList.remove("selected");
       groupState.selectButton.setAttribute("aria-pressed", "false");
       if (!groupState.selectButton.disabled) {
-        groupState.selectButton.textContent = "Select date";
+        groupState.selectButton.textContent = "Select group";
       }
     }
     if (groupState.selectedCountElement) {
@@ -538,6 +540,7 @@ function handleThumbnailClick(event, groupKey, index) {
     event.preventDefault();
     return;
   }
+  state.viewer.pendingBlend = 0;
   openViewerAt(groupKey, index);
 }
 
@@ -638,22 +641,102 @@ async function handleDownloadButtonClick(event) {
   await initiateDownload();
 }
 
+function updateFlyoutPinUI() {
+  if (!elements.flyoutPin) {
+    return;
+  }
+  elements.flyoutPin.classList.toggle("active", state.flyoutPinned);
+  elements.flyoutPin.setAttribute("aria-pressed", state.flyoutPinned ? "true" : "false");
+  elements.flyoutPin.setAttribute(
+    "aria-label",
+    state.flyoutPinned ? "Unpin controls" : "Pin controls",
+  );
+  const textSpan = elements.flyoutPin.querySelector(".pin-text");
+  if (textSpan) {
+    textSpan.textContent = state.flyoutPinned ? "Pinned" : "Pin";
+  }
+}
+
+function setFlyoutPinned(pinned) {
+  const normalized = Boolean(pinned);
+  if (state.flyoutPinned === normalized) {
+    if (normalized) {
+      setHeaderCollapsed(false);
+      if (!state.controlOpen) {
+        openControlPanel();
+      }
+    }
+    return;
+  }
+  state.flyoutPinned = normalized;
+  updateFlyoutPinUI();
+  if (normalized) {
+    if (!state.controlOpen) {
+      openControlPanel();
+    }
+    setHeaderCollapsed(false);
+  } else if (!state.controlOpen && !headerHover) {
+    setHeaderCollapsed(true);
+  }
+}
+
+function toggleFlyoutPin() {
+  setFlyoutPinned(!state.flyoutPinned);
+}
+
 function parseDateToValue(dateString) {
   if (!dateString) {
     return null;
   }
-  const parts = dateString.split("-");
-  if (parts.length !== 3) {
+  const normalized = dateString.trim();
+  if (!normalized) {
     return null;
   }
-  const [year, month, day] = parts.map((part) => Number.parseInt(part, 10));
-  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
-    return null;
+  const replaced = normalized.replace(/[_.]/g, "-");
+  const parts = replaced.split("-");
+  if (parts.length === 3 && parts[0].length === 4) {
+    const [yearRaw, monthRaw, dayRaw] = parts;
+    const year = Number.parseInt(yearRaw, 10);
+    const month = Number.parseInt(monthRaw, 10);
+    const day = Number.parseInt(dayRaw, 10);
+    if (
+      Number.isInteger(year) &&
+      Number.isInteger(month) &&
+      Number.isInteger(day) &&
+      month >= 1 &&
+      month <= 12 &&
+      day >= 1 &&
+      day <= 31
+    ) {
+      return year * 10000 + month * 100 + day;
+    }
   }
-  if (month < 1 || month > 12 || day < 1 || day > 31) {
-    return null;
+  const parsedDate = new Date(normalized);
+  if (!Number.isNaN(parsedDate.getTime())) {
+    return (
+      parsedDate.getUTCFullYear() * 10000 +
+      (parsedDate.getUTCMonth() + 1) * 100 +
+      parsedDate.getUTCDate()
+    );
   }
-  return year * 10000 + month * 100 + day;
+  const digits = normalized.replace(/\D/g, "");
+  if (digits.length >= 8) {
+    const year = Number.parseInt(digits.slice(0, 4), 10);
+    const month = Number.parseInt(digits.slice(4, 6), 10);
+    const day = Number.parseInt(digits.slice(6, 8), 10);
+    if (
+      Number.isInteger(year) &&
+      Number.isInteger(month) &&
+      Number.isInteger(day) &&
+      month >= 1 &&
+      month <= 12 &&
+      day >= 1 &&
+      day <= 31
+    ) {
+      return year * 10000 + month * 100 + day;
+    }
+  }
+  return null;
 }
 
 function formatValueToDateString(value) {
@@ -668,10 +751,120 @@ function formatValueToDateString(value) {
     .padStart(2, "0")}`;
 }
 
+function formatIsoDateFriendly(iso) {
+  if (!iso) {
+    return "";
+  }
+  const date = new Date(`${iso}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) {
+    return iso;
+  }
+  return new Intl.DateTimeFormat("en-US", {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(date);
+}
+
+function createSpecificEntry(rawValue) {
+  const raw = rawValue.trim();
+  if (!raw) {
+    return null;
+  }
+  if (/^\d{4}$/.test(raw)) {
+    const year = Number.parseInt(raw, 10);
+    if (year >= 0) {
+      return {
+        key: `year:${year}`,
+        type: "year",
+        year,
+        label: `Year ${year}`,
+      };
+    }
+  }
+  const dateValue = parseDateToValue(raw);
+  if (dateValue) {
+    const iso = formatValueToDateString(dateValue);
+    return {
+      key: `date:${iso}`,
+      type: "date",
+      iso,
+      label: formatIsoDateFriendly(iso),
+    };
+  }
+  const text = raw.toLowerCase();
+  return {
+    key: `text:${text}`,
+    type: "text",
+    text,
+    raw,
+    label: raw,
+  };
+}
+
+function deriveDateValueFromItem(item) {
+  if (!item) {
+    return null;
+  }
+  const candidates = [];
+  if (typeof item.dateHint === "string") {
+    candidates.push(item.dateHint);
+  }
+  if (typeof item.path === "string") {
+    const segments = item.path.split("/");
+    segments.forEach((segment) => candidates.push(segment));
+    candidates.push(item.path);
+  }
+  if (typeof item.name === "string") {
+    candidates.push(item.name);
+  }
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const value = parseDateToValue(candidate);
+    if (value) {
+      return value;
+    }
+  }
+  return null;
+}
+
 function clearRandomViewerTimer() {
   if (state.randomViewer.timerId) {
     clearTimeout(state.randomViewer.timerId);
     state.randomViewer.timerId = null;
+  }
+}
+
+function prepareViewerTransition(blendDuration) {
+  if (!elements.viewerImage || !elements.viewerImageOverlay) {
+    return;
+  }
+  const overlay = elements.viewerImageOverlay;
+  const main = elements.viewerImage;
+  if (blendDuration > 0 && main.src) {
+    overlay.src = main.src;
+    overlay.alt = main.alt || "";
+    overlay.style.transition = "";
+    overlay.style.opacity = "1";
+    overlay.hidden = false;
+  } else {
+    overlay.style.opacity = "0";
+    overlay.hidden = true;
+  }
+  main.style.transition = "";
+}
+
+function setViewerNavDisabled(disabled) {
+  if (elements.viewerPrev) {
+    elements.viewerPrev.disabled = Boolean(disabled);
+    elements.viewerPrev.classList.toggle("disabled", Boolean(disabled));
+    elements.viewerPrev.tabIndex = disabled ? -1 : 0;
+  }
+  if (elements.viewerNext) {
+    elements.viewerNext.disabled = Boolean(disabled);
+    elements.viewerNext.classList.toggle("disabled", Boolean(disabled));
+    elements.viewerNext.tabIndex = disabled ? -1 : 0;
   }
 }
 
@@ -681,8 +874,15 @@ function stopRandomViewer({ resetToggle = true } = {}) {
   state.randomViewer.enabled = false;
   state.randomViewer.lastPath = null;
   state.randomViewer.pool = [];
+  state.randomViewer.nextChoice = null;
   if (resetToggle && elements.randomViewerToggle) {
     elements.randomViewerToggle.checked = false;
+  }
+  setViewerNavDisabled(false);
+  state.viewer.pendingBlend = 0;
+  if (elements.viewerImageOverlay) {
+    elements.viewerImageOverlay.style.opacity = "0";
+    elements.viewerImageOverlay.hidden = true;
   }
   updateRandomViewerSettingsAvailability();
 }
@@ -691,26 +891,78 @@ function updateRandomViewerSettingsAvailability() {
   if (!elements.randomViewerSettings) {
     return;
   }
-  elements.randomViewerSettings.setAttribute("aria-hidden", "false");
+  elements.randomViewerSettings.removeAttribute("aria-hidden");
   if (elements.randomViewerSection) {
     elements.randomViewerSection.classList.toggle("random-viewer-active", state.randomViewer.running);
   }
   if (elements.randomViewerDuration) {
     elements.randomViewerDuration.value = String(state.randomViewer.duration);
   }
+  if (elements.randomViewerBlend) {
+    elements.randomViewerBlend.value = String(state.randomViewer.blend);
+  }
 }
 
 function buildRandomViewerPool() {
   const filter = state.randomViewer.filter;
-  const specificSet = filter.specific;
-  const hasSpecific = specificSet && specificSet.size > 0;
+  const specificEntries = filter.specificMap ? Array.from(filter.specificMap.values()) : [];
+  const hasSpecific = specificEntries.length > 0;
   const hasRange = filter.start !== null || filter.end !== null;
   const pool = [];
+  const topGroupMap = new Map();
+  state.topGroups.forEach((topGroup) => {
+    topGroupMap.set(topGroup.key, topGroup);
+  });
 
   state.imagesByGroup.forEach((items, groupKey) => {
     items.forEach((item) => {
-      const dateValue = Number.isInteger(item.dateValue) ? item.dateValue : null;
-      const matchesSpecific = hasSpecific && dateValue !== null && specificSet.has(dateValue);
+      let dateValue = Number.isInteger(item.dateValue) ? item.dateValue : null;
+      if (!dateValue) {
+        dateValue = deriveDateValueFromItem(item);
+        if (dateValue) {
+          item.dateValue = dateValue;
+        }
+      }
+      const isoValue = dateValue ? formatValueToDateString(dateValue) : null;
+      const matchesSpecific = hasSpecific
+        ? specificEntries.some((entry) => {
+            if (entry.type === "date") {
+              return isoValue && isoValue === entry.iso;
+            }
+            if (entry.type === "year") {
+              return dateValue && Math.floor(dateValue / 10000) === entry.year;
+            }
+            if (entry.type === "text") {
+              const target = entry.text;
+              if (!target) {
+                return false;
+              }
+              const lowerTarget = target.toLowerCase();
+              if (isoValue && isoValue.toLowerCase().includes(lowerTarget)) {
+                return true;
+              }
+              if (item.path && item.path.toLowerCase().includes(lowerTarget)) {
+                return true;
+              }
+              if (groupKey && groupKey.toLowerCase().includes(lowerTarget)) {
+                return true;
+              }
+              if (item.name && item.name.toLowerCase().includes(lowerTarget)) {
+                return true;
+              }
+              const topKey = groupKey.split("/")[0];
+              const topGroup = topGroupMap.get(topKey);
+              if (topGroup) {
+                const topLabel = (topGroup.formattedLabel || topGroup.label || "").toLowerCase();
+                if (topLabel.includes(lowerTarget)) {
+                  return true;
+                }
+              }
+              return false;
+            }
+            return false;
+          })
+        : false;
       let matchesRange = true;
       if (hasRange) {
         if (dateValue === null) {
@@ -735,7 +987,7 @@ function buildRandomViewerPool() {
       if (!item.path) {
         return;
       }
-      pool.push({ path: item.path, groupKey });
+      pool.push({ path: item.path, groupKey, dateValue, isoValue });
     });
   });
 
@@ -744,6 +996,7 @@ function buildRandomViewerPool() {
 }
 
 function refreshRandomViewerPool() {
+  state.randomViewer.nextChoice = null;
   return buildRandomViewerPool();
 }
 
@@ -752,9 +1005,50 @@ function scheduleRandomViewerTick() {
   if (!state.randomViewer.running) {
     return;
   }
+  const waitSeconds = Math.max(1, Number(state.randomViewer.duration) || 1) + Math.max(0, Number(state.randomViewer.blend) || 0);
   state.randomViewer.timerId = setTimeout(() => {
     runRandomViewerCycle();
-  }, Math.max(1, state.randomViewer.duration) * 1000);
+  }, waitSeconds * 1000);
+}
+
+function pickRandomChoice(excludePath = null) {
+  const pool = state.randomViewer.pool || [];
+  if (!pool.length) {
+    return null;
+  }
+  const filtered = excludePath
+    ? pool.filter((item) => item && item.path && item.path !== excludePath)
+    : pool.slice();
+  const source = filtered.length ? filtered : pool;
+  if (!source.length) {
+    return null;
+  }
+  const candidate = source[Math.floor(Math.random() * source.length)];
+  if (!candidate) {
+    return null;
+  }
+  return { path: candidate.path, groupKey: candidate.groupKey };
+}
+
+function preloadRandomChoice(excludePath = null) {
+  const choice = pickRandomChoice(excludePath);
+  if (!choice) {
+    state.randomViewer.nextChoice = null;
+    return null;
+  }
+  const src = `/api/image?path=${encodeURIComponent(choice.path)}`;
+  const preloader = new Image();
+  const ready = new Promise((resolve, reject) => {
+    preloader.onload = () => resolve(preloader);
+    preloader.onerror = reject;
+  });
+  preloader.src = src;
+  ready.catch(() => {});
+  choice.src = src;
+  choice.preloader = preloader;
+  choice.ready = ready;
+  state.randomViewer.nextChoice = choice;
+  return choice;
 }
 
 async function runRandomViewerCycle() {
@@ -769,34 +1063,25 @@ async function runRandomViewerCycle() {
       return;
     }
   }
-  const pool = state.randomViewer.pool;
-  let attempt = 0;
-  let choice = null;
-  while (attempt < pool.length) {
-    const candidate = pool[Math.floor(Math.random() * pool.length)];
-    if (!candidate) {
-      attempt += 1;
-      continue;
-    }
-    if (candidate.path !== state.randomViewer.lastPath || pool.length === 1) {
-      choice = candidate;
-      break;
-    }
-    attempt += 1;
-  }
+  let choice = state.randomViewer.nextChoice;
   if (!choice) {
-    choice = pool[0];
+    choice = preloadRandomChoice(state.randomViewer.lastPath);
   }
+  state.randomViewer.nextChoice = null;
   if (!choice) {
     stopRandomViewer();
     return;
   }
-
+  if (choice.ready) {
+    choice.ready.catch((error) => {
+      console.warn("Random viewer preload failed", error);
+    });
+  }
   if (!state.randomViewer.running) {
     return;
   }
-
   try {
+    state.viewer.pendingBlend = state.randomViewer.blend;
     await openImageByPath(choice.path);
     state.randomViewer.lastPath = choice.path;
   } catch (error) {
@@ -804,6 +1089,7 @@ async function runRandomViewerCycle() {
   }
 
   if (state.randomViewer.running) {
+    preloadRandomChoice(choice.path);
     scheduleRandomViewerTick();
   }
 }
@@ -815,6 +1101,12 @@ function startRandomViewer() {
       state.randomViewer.duration = currentValue;
     }
   }
+  if (elements.randomViewerBlend) {
+    const blendValue = Number.parseFloat(elements.randomViewerBlend.value);
+    if (Number.isFinite(blendValue) && blendValue >= 0) {
+      state.randomViewer.blend = blendValue;
+    }
+  }
   const pool = refreshRandomViewerPool();
   if (!pool.length) {
     alert("No images match the current filters for the random viewer.");
@@ -824,7 +1116,9 @@ function startRandomViewer() {
   state.randomViewer.enabled = true;
   state.randomViewer.running = true;
   state.randomViewer.lastPath = null;
+  preloadRandomChoice(null);
   updateRandomViewerSettingsAvailability();
+  setViewerNavDisabled(true);
   runRandomViewerCycle();
 }
 
@@ -849,12 +1143,24 @@ function updateRandomViewerDuration(event) {
 }
 
 function updateRandomViewerRange() {
-  const startValue = parseDateToValue(elements.randomViewerStart ? elements.randomViewerStart.value : "");
-  const endValue = parseDateToValue(elements.randomViewerEnd ? elements.randomViewerEnd.value : "");
+  let startValue = parseDateToValue(elements.randomViewerStart ? elements.randomViewerStart.value : "");
+  let endValue = parseDateToValue(elements.randomViewerEnd ? elements.randomViewerEnd.value : "");
+  if (startValue && endValue && endValue < startValue) {
+    const temp = startValue;
+    startValue = endValue;
+    endValue = temp;
+    if (elements.randomViewerStart) {
+      elements.randomViewerStart.value = formatValueToDateString(startValue);
+    }
+    if (elements.randomViewerEnd) {
+      elements.randomViewerEnd.value = formatValueToDateString(endValue);
+    }
+  }
   state.randomViewer.filter.start = startValue;
   state.randomViewer.filter.end = endValue;
   refreshRandomViewerPool();
   if (state.randomViewer.running) {
+    preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
   }
 }
@@ -869,35 +1175,41 @@ function renderRandomViewerChips() {
   if (!list.length) {
     return;
   }
-  list.forEach((value) => {
+  list.forEach((entry) => {
+    if (!entry) {
+      return;
+    }
     const wrapper = document.createElement("span");
     wrapper.className = "date-chip";
-    wrapper.dataset.value = String(value);
-    wrapper.textContent = formatValueToDateString(value);
+    wrapper.dataset.value = entry.key;
+    const label = document.createElement("span");
+    label.textContent = entry.label;
     const removeButton = document.createElement("button");
     removeButton.type = "button";
-    removeButton.setAttribute("aria-label", `Remove ${wrapper.textContent}`);
+    removeButton.setAttribute("aria-label", `Remove ${label.textContent}`);
     removeButton.textContent = "×";
     removeButton.addEventListener("click", () => {
-      removeRandomViewerSpecificDate(value);
+      removeRandomViewerSpecificDate(entry.key);
     });
-    wrapper.appendChild(removeButton);
+    wrapper.append(label, removeButton);
     container.appendChild(wrapper);
   });
 }
 
-function removeRandomViewerSpecificDate(value) {
-  const set = state.randomViewer.filter.specific;
-  if (!set.has(value)) {
+function removeRandomViewerSpecificDate(key) {
+  const filter = state.randomViewer.filter;
+  if (!filter || !filter.specificMap) {
     return;
   }
-  set.delete(value);
-  state.randomViewer.filter.specificList = state.randomViewer.filter.specificList.filter(
-    (item) => item !== value,
-  );
+  if (!filter.specificMap.has(key)) {
+    return;
+  }
+  filter.specificMap.delete(key);
+  filter.specificList = filter.specificList.filter((entry) => entry && entry.key !== key);
   renderRandomViewerChips();
   refreshRandomViewerPool();
   if (state.randomViewer.running) {
+    preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
   }
 }
@@ -907,23 +1219,28 @@ function addRandomViewerSpecificDate() {
   if (!input) {
     return;
   }
-  const value = parseDateToValue(input.value);
-  if (!value) {
-    alert("Please choose a valid date to add.");
+  const raw = input.value.trim();
+  if (!raw) {
     return;
   }
-  const set = state.randomViewer.filter.specific;
-  if (set.has(value)) {
+  const entry = createSpecificEntry(raw);
+  if (!entry) {
+    alert("Please enter a valid value (date, year, or text).");
+    return;
+  }
+  const filter = state.randomViewer.filter;
+  if (filter.specificMap.has(entry.key)) {
     input.value = "";
     return;
   }
-  set.add(value);
-  state.randomViewer.filter.specificList.push(value);
-  state.randomViewer.filter.specificList.sort((a, b) => a - b);
+  filter.specificMap.set(entry.key, entry);
+  filter.specificList.push(entry);
+  filter.specificList.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
   input.value = "";
   renderRandomViewerChips();
   refreshRandomViewerPool();
   if (state.randomViewer.running) {
+    preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
   }
 }
@@ -1026,7 +1343,14 @@ function handleDocumentClick(event) {
 
 
 function openControlPanel() {
-  if (!elements.header || !elements.controlContent || state.controlOpen) {
+  if (!elements.header || !elements.controlContent) {
+    return;
+  }
+  if (state.controlOpen) {
+    elements.controlContent.setAttribute("aria-hidden", "false");
+    if (!state.flyoutPinned) {
+      setHeaderCollapsed(false);
+    }
     return;
   }
   state.controlOpen = true;
@@ -1059,6 +1383,9 @@ document.addEventListener("touchstart", (event) => {
 
 function closeControlPanel() {
   if (!state.controlOpen || !elements.header || !elements.controlContent) {
+    return;
+  }
+  if (state.flyoutPinned) {
     return;
   }
   state.controlOpen = false;
@@ -1098,7 +1425,13 @@ function resetStateForOrder() {
     activeIndex: -1,
     filtered: [],
   };
-  state.viewer = { open: false, groupKey: null, index: -1 };
+  state.viewer = { open: false, groupKey: null, index: -1, pendingBlend: 0 };
+  state.randomViewer.filter = {
+    start: null,
+    end: null,
+    specificMap: new Map(),
+    specificList: [],
+  };
   elements.timelineSections.innerHTML = "";
   if (elements.searchSuggestions) {
     elements.searchSuggestions.hidden = true;
@@ -1179,7 +1512,7 @@ function buildTopGroup(topGroup) {
   section.dataset.topKey = topGroup.key;
 
   const heading = document.createElement("h2");
-  heading.textContent = topGroup.label;
+  heading.textContent = topGroup.formattedLabel || topGroup.label;
   section.appendChild(heading);
 
   const subgroups = Array.isArray(topGroup.subgroups) ? topGroup.subgroups : [];
@@ -1276,7 +1609,7 @@ function createSubgroup(topGroup, subgroup) {
     selectButton.textContent = "No photos";
     selectButton.disabled = true;
   } else {
-    selectButton.textContent = "Select date";
+    selectButton.textContent = "Select group";
   }
   actions.appendChild(selectButton);
   header.appendChild(actions);
@@ -1772,7 +2105,8 @@ function openViewerAt(groupKey, index) {
   if (elements.header) {
     elements.header.classList.add("viewer-hidden");
   }
-  showViewerLoading();
+  const blendDuration = Math.max(0, Number(state.viewer.pendingBlend) || 0);
+  showViewerLoading(blendDuration);
   updateUrlWithImage(targetItem.path);
   renderViewer();
 }
@@ -1812,22 +2146,51 @@ function renderViewer() {
   if (!item) {
     return;
   }
-  showViewerLoading();
-  if (elements.viewerImage) {
-    elements.viewerImage.style.opacity = "0";
+  const blendDuration = Math.max(0, Number(state.viewer.pendingBlend) || 0);
+  state.viewer.pendingBlend = 0;
+  prepareViewerTransition(blendDuration);
+  const mainImage = elements.viewerImage;
+  const overlayImage = elements.viewerImageOverlay;
+  if (mainImage) {
+    mainImage.style.opacity = "0";
+    if (blendDuration > 0) {
+      mainImage.style.transition = `opacity ${blendDuration}s ease`;
+    }
+    mainImage.src = `/api/image?path=${encodeURIComponent(item.path)}`;
+    mainImage.alt = item.name;
   }
-  elements.viewerImage.src = `/api/image?path=${encodeURIComponent(item.path)}`;
-  elements.viewerImage.alt = item.name;
   const finalize = () => {
     updateViewerMetadata(groupState, item);
     highlightActiveThumbnail(item);
-    requestAnimationFrame(() => {
-      if (elements.viewerImage) {
-        elements.viewerImage.style.opacity = "1";
+    if (mainImage) {
+      if (blendDuration > 0 && overlayImage && overlayImage.src) {
+        overlayImage.style.transition = `opacity ${blendDuration}s ease`;
+        overlayImage.hidden = false;
+        requestAnimationFrame(() => {
+          mainImage.style.opacity = "1";
+          overlayImage.style.opacity = "0";
+        });
+        setTimeout(() => {
+          overlayImage.style.transition = "";
+          overlayImage.style.opacity = "0";
+          overlayImage.hidden = true;
+          mainImage.style.transition = "";
+        }, blendDuration * 1000 + 60);
+      } else {
+        requestAnimationFrame(() => {
+          mainImage.style.opacity = "1";
+        });
+        if (overlayImage) {
+          overlayImage.style.opacity = "0";
+          overlayImage.hidden = true;
+        }
+        mainImage.style.transition = "";
       }
-    });
-    elements.viewerImage.removeEventListener("load", finalize);
-    elements.viewerImage.removeEventListener("error", handleError);
+    }
+    if (mainImage) {
+      mainImage.removeEventListener("load", finalize);
+      mainImage.removeEventListener("error", handleError);
+    }
   };
   const handleError = () => {
     setInfoBar(elements.viewerInfoTop, "Failed to load image", "block");
@@ -1838,14 +2201,20 @@ function renderViewer() {
     if (elements.viewerContainer) {
       elements.viewerContainer.classList.remove("portrait");
     }
-    if (elements.viewerImage) {
-      elements.viewerImage.style.opacity = "1";
+    if (mainImage) {
+      mainImage.style.opacity = "1";
+      mainImage.removeEventListener("load", finalize);
+      mainImage.removeEventListener("error", handleError);
     }
-    elements.viewerImage.removeEventListener("load", finalize);
-    elements.viewerImage.removeEventListener("error", handleError);
+    if (overlayImage) {
+      overlayImage.style.opacity = "0";
+      overlayImage.hidden = true;
+    }
   };
-  elements.viewerImage.addEventListener("load", finalize);
-  elements.viewerImage.addEventListener("error", handleError);
+  if (mainImage) {
+    mainImage.addEventListener("load", finalize);
+    mainImage.addEventListener("error", handleError);
+  }
 }
 
 function highlightActiveThumbnail(item) {
@@ -1871,13 +2240,22 @@ function setInfoBar(element, text, displayStyle) {
   }
 }
 
-function showViewerLoading() {
+function showViewerLoading(blendDuration = 0) {
   if (elements.viewerContainer) {
     elements.viewerContainer.classList.remove("portrait");
   }
   resetViewerTransform();
   if (elements.viewerImage) {
+    if (blendDuration > 0) {
+      elements.viewerImage.style.transition = `opacity ${blendDuration}s ease`;
+    } else {
+      elements.viewerImage.style.transition = "";
+    }
     elements.viewerImage.style.opacity = "0";
+  }
+  if (blendDuration <= 0 && elements.viewerImageOverlay) {
+    elements.viewerImageOverlay.style.opacity = "0";
+    elements.viewerImageOverlay.hidden = true;
   }
   setInfoBar(elements.viewerInfoTop, "Loading image…", "block");
   setInfoBar(elements.viewerInfoBottom, "", "block");
@@ -1929,6 +2307,7 @@ async function showNext() {
   if (nextIndex < currentGroup.images.length) {
     const entry = currentGroup.images[nextIndex];
     if (entry && entry.element) {
+      state.viewer.pendingBlend = 0;
       openViewerAt(currentGroup.key, nextIndex);
       return;
     }
@@ -1936,6 +2315,7 @@ async function showNext() {
     if (manifestItem && manifestItem.path) {
       const resolvedIndex = await ensureImageLoaded(manifestItem.path, currentGroup.key);
       if (resolvedIndex !== -1) {
+        state.viewer.pendingBlend = 0;
         openViewerAt(currentGroup.key, resolvedIndex);
         return;
       }
@@ -1955,6 +2335,7 @@ async function showNext() {
   if (target && target.path) {
     const resolvedIndex = await ensureImageLoaded(target.path, nextGroupKey);
     if (resolvedIndex !== -1) {
+      state.viewer.pendingBlend = 0;
       openViewerAt(nextGroupKey, resolvedIndex);
     }
   }
@@ -1972,6 +2353,7 @@ async function showPrevious() {
     const prevIndex = state.viewer.index - 1;
     const entry = currentGroup.images[prevIndex];
     if (entry && entry.element) {
+      state.viewer.pendingBlend = 0;
       openViewerAt(currentGroup.key, prevIndex);
       return;
     }
@@ -1980,6 +2362,7 @@ async function showPrevious() {
     if (manifestItem && manifestItem.path) {
       const resolvedIndex = await ensureImageLoaded(manifestItem.path, currentGroup.key);
       if (resolvedIndex !== -1) {
+        state.viewer.pendingBlend = 0;
         openViewerAt(currentGroup.key, resolvedIndex);
         return;
       }
@@ -2001,6 +2384,7 @@ async function showPrevious() {
     if (manifestItem && manifestItem.path) {
       const resolvedIndex = await ensureImageLoaded(manifestItem.path, prevGroupKey);
       if (resolvedIndex !== -1) {
+        state.viewer.pendingBlend = 0;
         openViewerAt(prevGroupKey, resolvedIndex);
       }
     }
@@ -2009,8 +2393,15 @@ async function showPrevious() {
 
 async function openImageByPath(path) {
   const groupKey = deriveGroupKey(path);
-  if (!state.groups.has(groupKey)) {
+  if (!state.groups.has(groupKey) && state.topGroups.length === 0) {
     await fetchHierarchy();
+  }
+  const topKey = groupKey.split("/")[0];
+  ensureTopGroupRendered(topKey);
+  ensureSubgroupRendered(groupKey);
+  if (!state.groups.has(groupKey)) {
+    ensureTopGroupRendered(topKey);
+    ensureSubgroupRendered(groupKey);
   }
   const groupState = state.groups.get(groupKey);
   if (!groupState) {
@@ -2023,6 +2414,7 @@ async function openImageByPath(path) {
     alert("Unable to locate the requested image.");
     return;
   }
+  state.viewer.pendingBlend = state.randomViewer.running ? state.randomViewer.blend : 0;
   openViewerAt(groupKey, index);
 }
 
@@ -2075,7 +2467,7 @@ function handleSearch(event) {
   }
   const matches = [];
   state.topGroups.forEach((topGroup) => {
-    const topLabel = topGroup.label;
+    const topLabel = topGroup.formattedLabel || topGroup.label;
     const subgroups = Array.isArray(topGroup.subgroups) ? topGroup.subgroups : [];
     subgroups.forEach((subgroup) => {
       const subgroupLabel = subgroup.formattedLabel || subgroup.label;
@@ -2205,6 +2597,23 @@ if (elements.randomViewerDuration) {
   elements.randomViewerDuration.addEventListener("input", updateRandomViewerDuration);
 }
 
+function updateRandomViewerBlend(event) {
+  const value = Number.parseFloat(event.target.value);
+  state.randomViewer.blend = Number.isFinite(value) && value >= 0 ? value : 0;
+  if (state.randomViewer.running) {
+    scheduleRandomViewerTick();
+  }
+}
+
+if (elements.randomViewerBlend) {
+  elements.randomViewerBlend.addEventListener("change", (event) => {
+    updateRandomViewerBlend(event);
+  });
+  elements.randomViewerBlend.addEventListener("input", (event) => {
+    updateRandomViewerBlend(event);
+  });
+}
+
 if (elements.randomViewerStart) {
   elements.randomViewerStart.addEventListener("change", updateRandomViewerRange);
 }
@@ -2222,6 +2631,19 @@ if (elements.randomViewerSpecificInput) {
     if (event.key === "Enter") {
       event.preventDefault();
       addRandomViewerSpecificDate();
+    }
+  });
+}
+
+if (elements.flyoutPin) {
+  elements.flyoutPin.addEventListener("click", (event) => {
+    event.preventDefault();
+    toggleFlyoutPin();
+  });
+  elements.flyoutPin.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggleFlyoutPin();
     }
   });
 }
@@ -2348,6 +2770,9 @@ function updateFlyoutHandleState(expanded) {
 
 function setHeaderCollapsed(collapsed) {
   if (!elements.header) return;
+  if (state.flyoutPinned && collapsed) {
+    collapsed = false;
+  }
   if (collapsed) {
     elements.header.classList.add('collapsed');
     elements.header.classList.remove('expanded');
@@ -2371,6 +2796,9 @@ function showHeader() {
 
 function hideHeaderIfIdle() {
   headerHover = false;
+  if (state.flyoutPinned) {
+    return;
+  }
   if (!state.controlOpen) {
     setHeaderCollapsed(true);
   }
@@ -2444,10 +2872,10 @@ document.addEventListener("click", (event) => {
   }
   const inHeader = elements.header.contains(event.target);
   if (state.controlOpen) {
-    if (!inHeader) {
+    if (!inHeader && !state.flyoutPinned) {
       closeControlPanel();
     }
-  } else if (!inHeader && !headerHover) {
+  } else if (!inHeader && !headerHover && !state.flyoutPinned) {
     setHeaderCollapsed(true);
   }
 });
@@ -2455,6 +2883,7 @@ document.addEventListener("click", (event) => {
 updateDownloadControls();
 updateRandomViewerSettingsAvailability();
 renderRandomViewerChips();
+updateFlyoutPinUI();
 
 setupViewerGestures();
 
@@ -2470,6 +2899,10 @@ document.addEventListener("keydown", async (event) => {
     }
     if (state.download.active && !state.download.inProgress) {
       setDownloadMode(false);
+      return;
+    }
+    if (state.flyoutPinned) {
+      setFlyoutPinned(false);
       return;
     }
     setHeaderCollapsed(!headerHover);

@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Barry Image Viewer</title>
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,6 +13,10 @@
     <header class="app-header collapsed" id="appHeader">
       <div class="header-bar">
         <h1>Barry Image Viewer</h1>
+        <button type="button" class="flyout-pin" id="flyoutPin" aria-pressed="false" aria-label="Pin controls">
+          <span class="pin-icon" aria-hidden="true">📌</span>
+          <span class="pin-text">Pin</span>
+        </button>
       </div>
       <div class="control-content" id="controlContent" aria-hidden="true">
         <div class="order-switch" id="orderSwitch">
@@ -38,29 +43,25 @@
             <select id="yearNavigationSelect"></select>
           </label>
         </nav>
-        <div class="download-controls" id="downloadControls">
-          <div class="download-row">
-            <button type="button" class="download-toggle" id="downloadToggle" aria-pressed="false">Select images</button>
-            <span class="download-count" id="downloadCount" aria-live="polite" hidden></span>
-          </div>
-          <div class="download-action-row">
-            <button type="button" class="download-action download-secondary" id="downloadClear" disabled>Clear</button>
-            <button type="button" class="download-action download-primary" id="downloadButton" disabled>Download</button>
-          </div>
-          <p class="download-hint">Tip: hold Ctrl (or ⌘) while clicking a thumbnail to add it without leaving viewer mode.</p>
-        </div>
         <section class="random-viewer" id="randomViewerSection">
           <header class="random-viewer-header">
-            <div class="random-viewer-toggle">
-              <input type="checkbox" id="randomViewerToggle" aria-describedby="randomViewerHelp">
-              <label for="randomViewerToggle">Random image viewer</label>
+            <div class="random-viewer-toggle" id="randomViewerToggleWrapper">
+              <label class="toggle-switch">
+                <input type="checkbox" id="randomViewerToggle" aria-labelledby="randomViewerToggleLabel" aria-describedby="randomViewerHelp">
+                <span class="toggle-slider"><span class="toggle-handle"></span></span>
+              </label>
+              <label class="random-viewer-label" id="randomViewerToggleLabel" for="randomViewerToggle">Random image viewer</label>
             </div>
             <p class="random-viewer-help" id="randomViewerHelp">Cycle through photos automatically like a digital frame.</p>
           </header>
-          <div class="random-viewer-settings" id="randomViewerSettings" aria-hidden="true">
+          <div class="random-viewer-settings" id="randomViewerSettings">
             <div class="random-setting">
               <label for="randomViewerDuration">Display time (seconds)</label>
               <input type="number" id="randomViewerDuration" min="3" max="300" step="1" value="10">
+            </div>
+            <div class="random-setting">
+              <label for="randomViewerBlend">Fade duration (seconds)</label>
+              <input type="number" id="randomViewerBlend" min="0" max="10" step="0.1" value="1">
             </div>
             <div class="random-setting random-dates">
               <fieldset>
@@ -75,10 +76,10 @@
             </div>
             <div class="random-setting random-specific-dates">
               <fieldset>
-                <legend>Specific dates</legend>
+                <legend>Specific values</legend>
                 <div class="specific-date-input">
-                  <input type="date" id="randomViewerSpecificInput">
-                  <button type="button" id="randomViewerAddDate">Add date</button>
+                  <input type="text" id="randomViewerSpecificInput" placeholder="e.g. 2023-12-24, 2025, Holidays">
+                  <button type="button" id="randomViewerAddDate">Add group</button>
                 </div>
                 <div class="specific-date-chips" id="randomViewerDateChips" aria-live="polite"></div>
               </fieldset>
@@ -88,6 +89,17 @@
       </div>
     </header>
     <main class="timeline" id="timeline">
+      <div class="download-bar" id="downloadControls">
+        <div class="download-row">
+          <button type="button" class="download-toggle" id="downloadToggle" aria-pressed="false">Select images</button>
+          <span class="download-count" id="downloadCount" aria-live="polite" hidden></span>
+        </div>
+        <div class="download-action-row">
+          <button type="button" class="download-action download-secondary" id="downloadClear" disabled>Clear</button>
+          <button type="button" class="download-action download-primary" id="downloadButton" disabled>Download</button>
+        </div>
+        <p class="download-hint">Tip: hold Ctrl (or ⌘) while clicking a thumbnail to add it without leaving viewer mode.</p>
+      </div>
       <div class="timeline-sections" id="timelineSections"></div>
       <div class="timeline-loader" id="timelineLoader">Loading…</div>
     </main>
@@ -100,7 +112,10 @@
       <div class="viewer-info-bar viewer-info-left" id="viewerInfoLeft"></div>
       <div class="viewer-stage">
         <button class="viewer-nav prev" id="viewerPrev" type="button" aria-label="Previous image">‹</button>
-        <img id="viewerImage" alt="Selected image">
+        <div class="viewer-image-stack">
+          <img id="viewerImage" class="viewer-image viewer-image-main" alt="Selected image">
+          <img id="viewerImageOverlay" class="viewer-image viewer-image-overlay" aria-hidden="true" hidden>
+        </div>
         <button class="viewer-nav next" id="viewerNext" type="button" aria-label="Next image">›</button>
       </div>
       <div class="viewer-info-bar viewer-info-right" id="viewerInfoRight"></div>
