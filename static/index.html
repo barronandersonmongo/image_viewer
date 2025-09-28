@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Barry Image Viewer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="flyoutHandle" class="flyout-handle" role="button" aria-label="Open controls" aria-controls="appHeader" aria-expanded="false" tabindex="0"></div>
+  <div id="app">
+    <header class="app-header collapsed" id="appHeader">
+      <div class="header-bar">
+        <h1>Barry Image Viewer</h1>
+      </div>
+      <div class="control-content" id="controlContent" aria-hidden="true">
+        <div class="order-switch" id="orderSwitch">
+          <span class="order-text order-text-left">Newest first</span>
+          <label class="order-toggle">
+            <input type="checkbox" id="orderToggle" aria-label="Toggle sort order">
+            <span class="order-slider"><span class="order-handle"></span></span>
+          </label>
+          <span class="order-text order-text-right">Oldest first</span>
+        </div>
+        <form id="searchForm" class="search-form">
+          <div class="search-combobox" id="searchCombobox" role="combobox" aria-expanded="false" aria-owns="searchSuggestions" aria-haspopup="listbox">
+            <input type="search" id="searchInput" placeholder="Search by date or choose a year" aria-label="Search by date" aria-autocomplete="list" aria-controls="searchSuggestions">
+            <ul class="search-suggestions" id="searchSuggestions" role="listbox" hidden></ul>
+          </div>
+          <button type="submit">Search</button>
+        </form>
+        <div class="search-results" id="searchResults"></div>
+        <nav class="year-navigation" id="yearNavigation" aria-label="Jump to year" hidden>
+          <p class="year-navigation-title" id="yearNavigationTitle">Jump to year</p>
+          <div class="year-navigation-buttons" id="yearNavigationButtons" role="group" aria-labelledby="yearNavigationTitle"></div>
+          <label class="year-navigation-select" for="yearNavigationSelect">
+            <span>Jump to year</span>
+            <select id="yearNavigationSelect"></select>
+          </label>
+        </nav>
+        <div class="download-controls" id="downloadControls">
+          <div class="download-row">
+            <button type="button" class="download-toggle" id="downloadToggle" aria-pressed="false">Select images</button>
+            <span class="download-count" id="downloadCount" aria-live="polite" hidden></span>
+          </div>
+          <div class="download-action-row">
+            <button type="button" class="download-action download-secondary" id="downloadClear" disabled>Clear</button>
+            <button type="button" class="download-action download-primary" id="downloadButton" disabled>Download</button>
+          </div>
+          <p class="download-hint">Tip: hold Ctrl (or ⌘) while clicking a thumbnail to add it without leaving viewer mode.</p>
+        </div>
+      </div>
+    </header>
+    <main class="timeline" id="timeline">
+      <div class="timeline-sections" id="timelineSections"></div>
+      <div class="timeline-loader" id="timelineLoader">Loading…</div>
+    </main>
+  </div>
+
+  <div class="viewer-overlay" id="viewerOverlay" hidden>
+    <div class="viewer-container" id="viewerContainer">
+      <button class="viewer-close" id="viewerClose" type="button" aria-label="Close viewer">×</button>
+      <div class="viewer-info-bar viewer-info-top" id="viewerInfoTop"></div>
+      <div class="viewer-info-bar viewer-info-left" id="viewerInfoLeft"></div>
+      <div class="viewer-stage">
+        <button class="viewer-nav prev" id="viewerPrev" type="button" aria-label="Previous image">‹</button>
+        <img id="viewerImage" alt="Selected image">
+        <button class="viewer-nav next" id="viewerNext" type="button" aria-label="Next image">›</button>
+      </div>
+      <div class="viewer-info-bar viewer-info-right" id="viewerInfoRight"></div>
+      <div class="viewer-info-bar viewer-info-bottom" id="viewerInfoBottom"></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
