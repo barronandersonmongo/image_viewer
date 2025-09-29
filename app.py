@@ -12,14 +12,22 @@ import os
 import re
 import time
 import zipfile
+from collections import Counter
 from datetime import datetime
 from http import HTTPStatus
 import http.server
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 from PIL import Image, ImageOps
+
+try:  # Optional dependency for MongoDB metadata support
+    from pymongo import MongoClient
+    from pymongo.collection import Collection
+except ImportError:  # pragma: no cover - pymongo may be absent in some environments
+    MongoClient = None
+    Collection = None
 
 SUPPORTED_EXTENSIONS = {
     ".jpg",
@@ -36,6 +44,9 @@ IGNORED_DIRECTORIES = {".Trash-1000"}
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_ROOT = Path("/home/barry/bobby/pictures")
+DEFAULT_MONGO_URI = "mongodb://192.168.1.8"
+DEFAULT_MONGO_DB = "barrydb"
+DEFAULT_MONGO_COLLECTION = "images"
 STATIC_DIR = Path(__file__).with_name("static")
 THUMBNAIL_DEFAULT_SIZE = 320
 THUMBNAIL_CACHE_DIR = Path(__file__).with_name(".thumbnail_cache")
@@ -50,6 +61,50 @@ _IMAGE_CACHE: Dict[str, object] = {
     "hierarchy_generated": 0.0,
     "hierarchy": None,
 }
+
+MONGO_COLLECTION: Optional["Collection"] = None
+
+_DB_CACHE: Dict[str, object] = {
+    "signature": None,
+    "documents": None,
+    "documents_generated": 0.0,
+    "paths": [],
+    "paths_generated": 0.0,
+    "hierarchy": None,
+    "hierarchy_generated": 0.0,
+}
+
+
+def _reset_db_cache() -> None:
+    _DB_CACHE.update(
+        {
+            "signature": None,
+            "documents": None,
+            "documents_generated": 0.0,
+            "paths": [],
+            "paths_generated": 0.0,
+            "hierarchy": None,
+            "hierarchy_generated": 0.0,
+        }
+    )
+
+
+def _current_db_signature() -> Optional[str]:
+    collection = MONGO_COLLECTION
+    if collection is None:
+        return None
+    try:
+        name = collection.full_name  # type: ignore[attr-defined]
+    except Exception:
+        name = None
+    return name or f"collection:{id(collection)}"
+
+
+def set_database_collection(collection: Optional["Collection"]) -> None:
+    global MONGO_COLLECTION
+    MONGO_COLLECTION = collection
+    _reset_db_cache()
+
 
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("image/svg+xml", ".svg")
@@ -109,6 +164,134 @@ def guess_date_hint(relative_path: Path) -> Optional[str]:
                 return cleaned
     return None
 
+
+def using_database() -> bool:
+    return MONGO_COLLECTION is not None
+
+
+def _relative_path_from_id(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.replace("\\", "/").lstrip("/").strip()
+    return normalized or None
+
+
+def _date_value_from_iso(value: object) -> Optional[int]:
+    if isinstance(value, datetime):
+        dt_obj = value
+    elif isinstance(value, str):
+        try:
+            dt_obj = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return dt_obj.year * 10000 + dt_obj.month * 100 + dt_obj.day
+
+
+def _format_location_label(location: object) -> Optional[str]:
+    if not isinstance(location, dict):
+        return None
+
+    address = location.get("address")
+    if not isinstance(address, dict):
+        address = {}
+
+    components: List[str] = []
+    primary_keys = ("city", "town", "village", "hamlet", "suburb", "municipality")
+    for key in primary_keys:
+        value = address.get(key)
+        if value:
+            components.append(str(value))
+            break
+
+    if not components:
+        for key in ("neighbourhood", "county", "state_district"):
+            value = address.get(key)
+            if value:
+                components.append(str(value))
+                break
+
+    road = address.get("road")
+    if road and not components:
+        components.append(str(road))
+
+    state = address.get("state") or address.get("region") or address.get("province")
+    if state:
+        components.append(str(state))
+
+    country = address.get("country")
+    if country:
+        components.append(str(country))
+
+    poi = location.get("poi")
+    if isinstance(poi, dict):
+        name = poi.get("name")
+        if name:
+            components.insert(0, str(name))
+
+    deduped: List[str] = []
+    seen = set()
+    for part in components:
+        normalized = part.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+
+    if deduped:
+        return ", ".join(deduped)
+
+    raw = location.get("raw")
+    if isinstance(raw, dict):
+        display = raw.get("display_name")
+        if display:
+            return str(display)
+
+    return None
+
+
+def _fetch_database_documents() -> List[Dict[str, object]]:
+    collection = MONGO_COLLECTION
+    if collection is None:
+        return []
+
+    signature = _current_db_signature()
+    now = time.time()
+    documents_cached = _DB_CACHE.get("documents")
+    if (
+        signature
+        and _DB_CACHE.get("signature") == signature
+        and isinstance(documents_cached, list)
+        and now - float(_DB_CACHE.get("documents_generated", 0.0)) < IMAGE_CACHE_TTL_SECONDS
+    ):
+        return documents_cached  # type: ignore[return-value]
+
+    projection = {
+        "_id": 1,
+        "image_datetime": 1,
+        "date_specific": 1,
+        "location": 1,
+    }
+    cursor = collection.find({}, projection)
+    documents: List[Dict[str, object]] = []
+    for doc in cursor:
+        record: Dict[str, object] = {
+            "_id": doc.get("_id"),
+            "image_datetime": doc.get("image_datetime"),
+            "date_specific": doc.get("date_specific"),
+        }
+        if "location" in doc:
+            record["location"] = doc.get("location")
+        documents.append(record)
+
+    _DB_CACHE["signature"] = signature
+    _DB_CACHE["documents"] = documents
+    _DB_CACHE["documents_generated"] = now
+    return documents
 
 def build_breadcrumbs(root: Path, target: Path) -> List[Dict[str, str]]:
     breadcrumbs = [{"name": "Home", "path": ""}]
@@ -330,6 +513,8 @@ def format_date_value(value: int) -> Optional[str]:
         return datetime(year, month, day).strftime("%B %d, %Y").replace(" 0", " ")
     except ValueError:
         return None
+
+
 def sanitize_zip_component(component: str, fallback: str = "item") -> str:
     cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", component).strip()
     cleaned = cleaned.replace("\0", "_")
@@ -338,7 +523,63 @@ def sanitize_zip_component(component: str, fallback: str = "item") -> str:
     return cleaned
 
 
+def _sorted_image_paths_db(order: str) -> List[str]:
+    signature = _current_db_signature()
+    now = time.time()
+    cached_paths = _DB_CACHE.get("paths")
+    if (
+        signature
+        and _DB_CACHE.get("signature") == signature
+        and isinstance(cached_paths, list)
+        and now - float(_DB_CACHE.get("paths_generated", 0.0)) < IMAGE_CACHE_TTL_SECONDS
+    ):
+        cache_paths = list(cached_paths)
+    else:
+        documents = _fetch_database_documents()
+        dated: List[tuple[int, str]] = []
+        undated: List[str] = []
+        for doc in documents:
+            relative = _relative_path_from_id(doc.get("_id"))
+            if not relative:
+                continue
+            rel_path = PurePosixPath(relative)
+            date_value = _date_value_from_iso(doc.get("image_datetime"))
+            has_date = bool(date_value and doc.get("date_specific", True))
+            if not date_value:
+                has_date, date_value_candidate = _extract_date_value(rel_path)
+                if has_date:
+                    date_value = date_value_candidate
+            if has_date and date_value:
+                dated.append((date_value, relative))
+            else:
+                undated.append(relative)
+
+        dated.sort(key=lambda item: (item[0], item[1].lower()))
+        undated.sort(key=lambda path: path.lower())
+        cache_paths = [path for _value, path in dated] + undated
+
+        _DB_CACHE["signature"] = signature
+        _DB_CACHE["paths"] = cache_paths
+        _DB_CACHE["paths_generated"] = now
+
+    if order == "asc":
+        return list(cache_paths)
+
+    dated_paths = []
+    undated_paths = []
+    for path in cache_paths:
+        has_date, _ = _extract_date_value(PurePosixPath(path))
+        if has_date:
+            dated_paths.append(path)
+        else:
+            undated_paths.append(path)
+    dated_paths.reverse()
+    return dated_paths + undated_paths
+
+
 def sorted_image_paths(root: Path, order: str = "desc") -> List[str]:
+    if using_database():
+        return _sorted_image_paths_db(order)
     cache_root = _IMAGE_CACHE["root"]
     now = time.time()
     if cache_root == root and now - float(_IMAGE_CACHE["generated"]) < IMAGE_CACHE_TTL_SECONDS:
@@ -427,7 +668,162 @@ def timeline_sections(
     return {"sections": sections, "nextCursor": next_cursor}
 
 
+def _build_hierarchy_db() -> Dict[str, object]:
+    signature = _current_db_signature()
+    now = time.time()
+    cached_hierarchy = _DB_CACHE.get("hierarchy")
+    if (
+        signature
+        and _DB_CACHE.get("signature") == signature
+        and isinstance(cached_hierarchy, dict)
+        and now - float(_DB_CACHE.get("hierarchy_generated", 0.0)) < IMAGE_CACHE_TTL_SECONDS
+    ):
+        return cached_hierarchy  # type: ignore[return-value]
+
+    documents = _fetch_database_documents()
+    top_groups: Dict[str, Dict[str, object]] = {}
+    images_by_group: Dict[str, List[Dict[str, object]]] = {}
+    location_counts: Dict[str, Counter] = {}
+
+    for doc in documents:
+        relative = _relative_path_from_id(doc.get("_id"))
+        if not relative:
+            continue
+        rel_path = PurePosixPath(relative)
+        parts = rel_path.parts
+        if not parts:
+            continue
+
+        top_key = parts[0]
+        top_label = top_key
+        if len(parts) >= 2:
+            subgroup_key = f"{parts[0]}/{parts[1]}"
+            subgroup_label = parts[1]
+        else:
+            subgroup_key = top_key
+            subgroup_label = top_label
+
+        date_value = _date_value_from_iso(doc.get("image_datetime")) or 0
+        has_date = bool(date_value and doc.get("date_specific", True))
+        if not date_value:
+            extracted_has_date, extracted_value = _extract_date_value(rel_path)
+            if extracted_has_date:
+                has_date = True
+                date_value = extracted_value
+
+        date_hint = guess_date_hint(Path(rel_path)) or subgroup_label
+        image_item = {
+            "name": rel_path.name,
+            "path": relative,
+            "dateHint": date_hint,
+            "dateValue": date_value,
+            "hasDate": has_date,
+        }
+        images_by_group.setdefault(subgroup_key, []).append(image_item)
+
+        top_entry = top_groups.setdefault(
+            top_key,
+            {
+                "key": top_key,
+                "label": top_label,
+                "count": 0,
+                "maxDate": 0,
+                "subgroups": {},
+            },
+        )
+        top_entry["count"] = int(top_entry.get("count", 0)) + 1
+        if has_date:
+            top_entry["maxDate"] = max(int(top_entry.get("maxDate", 0)), date_value)
+
+        subgroup_entry = top_entry["subgroups"].setdefault(
+            subgroup_key,
+            {
+                "key": subgroup_key,
+                "label": subgroup_label,
+                "count": 0,
+                "maxDate": 0,
+            },
+        )
+        subgroup_entry["count"] = int(subgroup_entry.get("count", 0)) + 1
+        if has_date:
+            subgroup_entry["maxDate"] = max(int(subgroup_entry.get("maxDate", 0)), date_value)
+
+        location_label = _format_location_label(doc.get("location"))
+        if location_label:
+            counter = location_counts.setdefault(subgroup_key, Counter())
+            counter[location_label] += 1
+
+    for image_list in images_by_group.values():
+        image_list.sort(
+            key=lambda item: (
+                1 if item.get("hasDate") else 0,
+                item.get("dateValue", 0),
+                (item.get("path") or "").lower(),
+            ),
+            reverse=True,
+        )
+
+    top_group_list: List[Dict[str, object]] = []
+    for top_entry in top_groups.values():
+        subgroups_raw = top_entry["subgroups"].values()
+        subgroups_list: List[Dict[str, object]] = []
+        for sub in subgroups_raw:
+            location_label = None
+            counter = location_counts.get(sub["key"])
+            if counter:
+                location_label = counter.most_common(1)[0][0]
+            max_date_value = int(sub.get("maxDate", 0))
+            formatted_label = (
+                format_date_value(max_date_value)
+                or format_display_date(str(sub.get("label")))
+                or str(sub.get("label"))
+            )
+            subgroup_payload: Dict[str, object] = {
+                "key": sub["key"],
+                "label": sub["label"],
+                "formattedLabel": formatted_label,
+                "count": sub["count"],
+                "dateValue": max_date_value,
+            }
+            if location_label:
+                subgroup_payload["location"] = location_label
+            subgroups_list.append(subgroup_payload)
+        subgroups_list.sort(
+            key=lambda item: (item["dateValue"], item["key"]), reverse=True
+        )
+        formatted_top_label = (
+            format_display_date(str(top_entry["label"]))
+            or str(top_entry["label"])
+        )
+        top_group_list.append(
+            {
+                "key": top_entry["key"],
+                "label": top_entry["label"],
+                "formattedLabel": formatted_top_label,
+                "count": top_entry["count"],
+                "dateValue": top_entry["maxDate"],
+                "subgroups": subgroups_list,
+            }
+        )
+
+    top_group_list.sort(
+        key=lambda item: (item["dateValue"], item["key"]), reverse=True
+    )
+
+    hierarchy = {
+        "top_groups": top_group_list,
+        "images_by_group": images_by_group,
+    }
+
+    _DB_CACHE["signature"] = signature
+    _DB_CACHE["hierarchy"] = hierarchy
+    _DB_CACHE["hierarchy_generated"] = now
+    return hierarchy
+
+
 def build_hierarchy(root: Path) -> Dict[str, object]:
+    if using_database():
+        return _build_hierarchy_db()
     cache_root = _IMAGE_CACHE.get("hierarchy_root")
     now = time.time()
     cached_hierarchy = _IMAGE_CACHE.get("hierarchy")
@@ -704,6 +1100,8 @@ def generate_thumbnail(image_path: Path, max_size: int) -> Optional[tuple[bytes,
 
 class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
     root_path: Path = DEFAULT_ROOT
+    mongo_collection: Optional["Collection"] = None
+    mongo_client: Optional["MongoClient"] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
@@ -1035,6 +1433,29 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Host to bind (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port to listen on (default: {DEFAULT_PORT})")
+    parser.add_argument(
+        "--mongo-uri",
+        default=DEFAULT_MONGO_URI,
+        help=(
+            "MongoDB connection URI. Set to an empty string to disable database-backed metadata "
+            f"(default: {DEFAULT_MONGO_URI})."
+        ),
+    )
+    parser.add_argument(
+        "--mongo-db",
+        default=DEFAULT_MONGO_DB,
+        help=f"MongoDB database name (default: {DEFAULT_MONGO_DB}).",
+    )
+    parser.add_argument(
+        "--mongo-collection",
+        default=DEFAULT_MONGO_COLLECTION,
+        help=f"MongoDB collection name (default: {DEFAULT_MONGO_COLLECTION}).",
+    )
+    parser.add_argument(
+        "--no-mongo",
+        action="store_true",
+        help="Disable MongoDB integration and fall back to filesystem scanning.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1048,6 +1469,40 @@ def main() -> None:
 
     handler_class = ImageRequestHandler
     handler_class.root_path = root_path
+
+    collection: Optional["Collection"] = None
+    client = None
+    if args.no_mongo:
+        print("MongoDB integration disabled via --no-mongo; using filesystem metadata.")
+    elif MongoClient is None:
+        if args.mongo_uri:
+            print("[WARN] pymongo not available; continuing without MongoDB support.")
+    else:
+        mongo_uri = (args.mongo_uri or "").strip()
+        if not mongo_uri:
+            print("MongoDB URI empty; using filesystem metadata.")
+        else:
+            try:
+                client = MongoClient(
+                    mongo_uri,
+                    tz_aware=True,
+                    serverSelectionTimeoutMS=5000,
+                )
+                client.admin.command("ping")
+                collection = client[args.mongo_db][args.mongo_collection]
+                print(
+                    f"Using MongoDB metadata from {collection.database.name}.{collection.name}"
+                )
+            except Exception as exc:  # noqa: BLE001 - surface connection errors clearly
+                collection = None
+                print(
+                    f"[WARN] Failed to connect to MongoDB at {mongo_uri}: {exc}. "
+                    "Falling back to filesystem metadata."
+                )
+
+    handler_class.mongo_client = client
+    handler_class.mongo_collection = collection
+    set_database_collection(collection)
 
     print("Warming caches...")
     warm_cache(root_path)
