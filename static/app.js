@@ -781,6 +781,7 @@ function createSpecificEntry(rawValue) {
         year,
         label: `Year ${year}`,
         raw,
+        text: String(year).toLowerCase(),
       };
     }
   }
@@ -792,6 +793,7 @@ function createSpecificEntry(rawValue) {
       type: "date",
       iso,
       label: formatIsoDateFriendly(iso),
+      text: iso.toLowerCase(),
       raw,
     };
   }
@@ -850,8 +852,10 @@ function normalizeRandomViewerFilters() {
     } else if (entry && typeof entry === "object" && entry.key) {
       if (entry.type === "date" && entry.iso) {
         entry.label = formatIsoDateFriendly(entry.iso);
+        entry.text = entry.text || entry.iso.toLowerCase();
       } else if (entry.type === "year" && entry.year !== undefined) {
         entry.label = entry.label || `Year ${entry.year}`;
+        entry.text = entry.text || String(entry.year).toLowerCase();
       } else if (entry.type === "text") {
         entry.text = entry.text || (entry.raw ? entry.raw.toLowerCase() : "");
         entry.label = entry.label || entry.raw || entry.text;

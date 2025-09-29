@@ -318,6 +318,18 @@ def format_display_date(label: str) -> Optional[str]:
     if not date_obj:
         return None
     return f"{date_obj:%B} {date_obj.day}, {date_obj.year}"
+
+
+def format_date_value(value: int) -> Optional[str]:
+    if not isinstance(value, int) or value <= 0:
+        return None
+    year = value // 10000
+    month = (value % 10000) // 100
+    day = value % 100
+    try:
+        return datetime(year, month, day).strftime("%B %d, %Y").replace(" 0", " ")
+    except ValueError:
+        return None
 def sanitize_zip_component(component: str, fallback: str = "item") -> str:
     cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", component).strip()
     cleaned = cleaned.replace("\0", "_")
@@ -500,7 +512,7 @@ def build_hierarchy(root: Path) -> Dict[str, object]:
         subgroups_raw = top_entry["subgroups"].values()
         subgroups_list: List[Dict[str, object]] = []
         for sub in subgroups_raw:
-            formatted_label = format_display_date(sub["label"]) or sub["label"]
+            formatted_label = format_date_value(sub.get("maxDate", 0)) or format_display_date(sub["label"]) or sub["label"]
             subgroup_payload: Dict[str, object] = {
                 "key": sub["key"],
                 "label": sub["label"],
