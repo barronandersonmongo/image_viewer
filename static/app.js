@@ -34,7 +34,6 @@ const state = {
   activeThumb: null,
   controlOpen: false,
   download: {
-    active: false,
     items: new Map(),
     perGroupCounts: new Map(),
     groupSelections: new Set(),
@@ -49,6 +48,7 @@ const state = {
     lastPath: null,
     nextChoice: null,
     pool: [],
+    queue: [],
     filter: {
       start: null,
       end: null,
@@ -88,7 +88,6 @@ const elements = {
   yearNavigationButtons: document.getElementById("yearNavigationButtons"),
   yearNavigationSelect: document.getElementById("yearNavigationSelect"),
   downloadControls: document.getElementById("downloadControls"),
-  downloadToggle: document.getElementById("downloadToggle"),
   downloadCount: document.getElementById("downloadCount"),
   downloadButton: document.getElementById("downloadButton"),
   downloadClear: document.getElementById("downloadClear"),
@@ -196,21 +195,8 @@ function renderYearNavigation(options = []) {
   }
 
   const items = Array.isArray(options) ? options.filter((item) => item && item.key) : [];
-  items.sort((a, b) => {
-    const aValue = typeof a.dateValue === "number" ? a.dateValue : 0;
-    const bValue = typeof b.dateValue === "number" ? b.dateValue : 0;
-    const aHasDate = aValue > 0;
-    const bHasDate = bValue > 0;
-    if (aHasDate !== bHasDate) {
-      return aHasDate ? -1 : 1;
-    }
-    if (aHasDate && aValue !== bValue) {
-      return bValue - aValue;
-    }
-    const aLabel = (a.label || "").toString();
-    const bLabel = (b.label || "").toString();
-    return bLabel.localeCompare(aLabel, undefined, { numeric: true, sensitivity: "base" });
-  });
+  const order = state.order === "asc" ? "asc" : "desc";
+  items.sort((a, b) => compareGroupOptions(a, b, order));
   if (!items.length) {
     nav.hidden = true;
     return;
@@ -257,23 +243,43 @@ function buildTopGroupOptions(groups) {
     count: group.count || 0,
     dateValue: typeof group.dateValue === "number" ? group.dateValue : 0,
   }));
-  options.sort((a, b) => {
-    const aValue = typeof a.dateValue === "number" ? a.dateValue : 0;
-    const bValue = typeof b.dateValue === "number" ? b.dateValue : 0;
-    const aHasDate = aValue > 0;
-    const bHasDate = bValue > 0;
-    if (aHasDate !== bHasDate) {
-      return aHasDate ? -1 : 1;
-    }
-    if (aHasDate && aValue !== bValue) {
-      return bValue - aValue;
-    }
-    return (b.label || "").localeCompare(a.label || "", undefined, { numeric: true, sensitivity: "base" });
-  });
+  const order = state.order === "asc" ? "asc" : "desc";
+  options.sort((a, b) => compareGroupOptions(a, b, order));
   state.topGroupOptions = options;
   state.combobox.filtered = options.slice();
   renderYearNavigation(options);
   renderComboboxOptions();
+}
+
+function shuffleArray(items) {
+  for (let index = items.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    const temp = items[index];
+    items[index] = items[swapIndex];
+    items[swapIndex] = temp;
+  }
+  return items;
+}
+
+function compareGroupOptions(a, b, order = "desc") {
+  const normalized = order === "asc" ? "asc" : "desc";
+  const aValue = typeof a.dateValue === "number" ? a.dateValue : 0;
+  const bValue = typeof b.dateValue === "number" ? b.dateValue : 0;
+  const aHasDate = aValue > 0;
+  const bHasDate = bValue > 0;
+  if (aHasDate !== bHasDate) {
+    return aHasDate ? -1 : 1;
+  }
+  if (aHasDate && aValue !== bValue) {
+    return normalized === "asc" ? aValue - bValue : bValue - aValue;
+  }
+  const aLabel = (a.label || "").toString();
+  const bLabel = (b.label || "").toString();
+  const labelCompare = aLabel.localeCompare(bLabel, undefined, { numeric: true, sensitivity: "base" });
+  if (labelCompare !== 0) {
+    return normalized === "asc" ? labelCompare : -labelCompare;
+  }
+  return 0;
 }
 
 function openCombobox() {
@@ -335,7 +341,12 @@ function setThumbnailSelectionState(element, selected) {
     return;
   }
   element.classList.toggle("selected", Boolean(selected));
-  element.setAttribute("aria-pressed", selected ? "true" : "false");
+  element.setAttribute("aria-checked", selected ? "true" : "false");
+  const indicator = element.querySelector(".thumbnail-select-indicator");
+  if (indicator) {
+    indicator.setAttribute("aria-checked", selected ? "true" : "false");
+    indicator.setAttribute("aria-label", selected ? "Deselect" : "Select for download");
+  }
 }
 
 function updateThumbnailSelectionVisual(path, selected) {
@@ -357,6 +368,109 @@ function updateThumbnailSelectionVisual(path, selected) {
   setThumbnailSelectionState(entry.element, selected);
 }
 
+async function fetchGroupImages(groupKey, { cursor = null, limit = THUMBNAILS_PER_GROUP } = {}) {
+  if (!groupKey) {
+    return { images: [], nextCursor: null };
+  }
+  const params = new URLSearchParams({ group: groupKey, order: state.order, limit: String(limit) });
+  if (cursor) {
+    params.set("cursor", cursor);
+  }
+  return fetchJson(`/api/group-images?${params.toString()}`);
+}
+
+function appendGroupImages(groupState, images) {
+  if (!groupState || !Array.isArray(images) || !images.length) {
+    return;
+  }
+  const manifest = groupState.manifest || [];
+  images.forEach((item) => {
+    if (!item || !item.path) {
+      return;
+    }
+    const existing = manifest.find((entry) => entry && entry.path === item.path);
+    if (existing) {
+      return;
+    }
+    const normalized = {
+      name: item.name || item.path.split("/").pop() || item.path,
+      path: item.path,
+      dateHint: item.dateHint || null,
+      dateValue: typeof item.dateValue === "number" ? item.dateValue : null,
+    };
+    const index = manifest.length;
+    manifest.push(normalized);
+    groupState.manifest = manifest;
+    groupState.images[index] = groupState.images[index] || null;
+    state.pathToImage.set(normalized.path, { groupKey: groupState.key, index });
+  });
+  if (groupState.total) {
+    groupState.total = Math.max(groupState.total, manifest.length);
+  } else {
+    groupState.total = manifest.length;
+  }
+  if (groupState.total > 0 && manifest.length >= groupState.total) {
+    groupState.fullyLoaded = true;
+    groupState.nextCursor = null;
+  }
+}
+
+async function ensureGroupManifestCount(groupState, minCount = THUMBNAILS_PER_GROUP) {
+  if (!groupState || groupState.total === 0) {
+    return;
+  }
+  if (!state.imagesByGroup.has(groupState.key)) {
+    state.imagesByGroup.set(groupState.key, []);
+  }
+  groupState.manifest = state.imagesByGroup.get(groupState.key) || [];
+  const manifest = groupState.manifest;
+  if (groupState.total > 0 && manifest.length >= groupState.total) {
+    groupState.fullyLoaded = true;
+    return;
+  }
+  const target = Math.min(groupState.total, Math.max(minCount, 0));
+
+  while (manifest.length < target) {
+    if (groupState.fullyLoaded) {
+      break;
+    }
+    if (groupState.loading) {
+      try {
+        await groupState.loading;
+      } catch (error) {
+        console.error("Failed to load group images", error);
+        break;
+      }
+      continue;
+    }
+    const fetchLimit = Math.max(THUMBNAILS_PER_GROUP, target - manifest.length);
+    groupState.loading = fetchGroupImages(groupState.key, {
+      limit: fetchLimit,
+      cursor: groupState.nextCursor || undefined,
+    })
+      .then((data) => {
+        const images = Array.isArray(data.images) ? data.images : [];
+        appendGroupImages(groupState, images);
+        state.imagesByGroup.set(groupState.key, groupState.manifest);
+        groupState.nextCursor = data.nextCursor || null;
+        if (!data.nextCursor) {
+          groupState.fullyLoaded = true;
+        }
+      })
+      .catch((error) => {
+        console.error(`Failed to fetch images for group ${groupState.key}`, error);
+        groupState.fullyLoaded = true;
+      })
+      .finally(() => {
+        groupState.loading = null;
+      });
+    try {
+      await groupState.loading;
+    } catch (_error) {
+      break;
+    }
+  }
+}
 function adjustGroupSelectedCount(groupKey, delta) {
   if (!groupKey) {
     return 0;
@@ -396,8 +510,12 @@ function updateGroupSelectionStatus(groupKey) {
     groupState.selectButton.classList.toggle("selected", fullySelected);
     groupState.selectButton.setAttribute("aria-pressed", fullySelected ? "true" : "false");
     if (!groupState.selectButton.disabled) {
-      groupState.selectButton.textContent = fullySelected ? "Deselect group" : "Select group";
+      groupState.selectButton.textContent = fullySelected ? "Clear Selection" : "Select All";
     }
+    groupState.selectButton.setAttribute(
+      "aria-label",
+      fullySelected ? "Clear selection for this group" : "Select all images in this group",
+    );
   }
   if (groupState.container) {
     groupState.container.classList.toggle("group-selected", count > 0);
@@ -431,28 +549,9 @@ function updateDownloadControls() {
   if (elements.downloadClear) {
     elements.downloadClear.disabled = selectedCount === 0 || state.download.inProgress;
   }
-  if (elements.downloadToggle) {
-    elements.downloadToggle.classList.toggle("active", state.download.active);
-    elements.downloadToggle.setAttribute("aria-pressed", state.download.active ? "true" : "false");
-    elements.downloadToggle.textContent = state.download.active ? "Exit selection" : "Select images";
-    elements.downloadToggle.disabled = state.download.inProgress;
-  }
 }
 
-function setDownloadMode(active) {
-  const normalized = Boolean(active);
-  if (state.download.active === normalized) {
-    return;
-  }
-  state.download.active = normalized;
-  if (elements.timeline) {
-    elements.timeline.classList.toggle("download-mode", normalized);
-  }
-  updateDownloadControls();
-}
-
-function resetDownloadState({ keepMode = false } = {}) {
-  const preserveMode = Boolean(keepMode && state.download.active);
+function resetDownloadState() {
   state.download.items.clear();
   state.download.perGroupCounts.clear();
   state.download.groupSelections.clear();
@@ -472,7 +571,7 @@ function resetDownloadState({ keepMode = false } = {}) {
       groupState.selectButton.classList.remove("selected");
       groupState.selectButton.setAttribute("aria-pressed", "false");
       if (!groupState.selectButton.disabled) {
-        groupState.selectButton.textContent = "Select group";
+        groupState.selectButton.textContent = "Select All";
       }
     }
     if (groupState.selectedCountElement) {
@@ -480,10 +579,6 @@ function resetDownloadState({ keepMode = false } = {}) {
       groupState.selectedCountElement.textContent = "";
     }
   });
-  if (elements.timeline) {
-    elements.timeline.classList.toggle("download-mode", preserveMode);
-  }
-  state.download.active = preserveMode;
   updateDownloadControls();
 }
 
@@ -512,7 +607,7 @@ function toggleImageSelection(path, groupKey, forceSelected, options = {}) {
   return true;
 }
 
-function toggleGroupDownloadSelection(groupKey, desiredState) {
+async function toggleGroupDownloadSelection(groupKey, desiredState) {
   if (state.download.inProgress) {
     return;
   }
@@ -520,6 +615,7 @@ function toggleGroupDownloadSelection(groupKey, desiredState) {
   if (!groupState) {
     return;
   }
+  await ensureGroupManifestCount(groupState, groupState.total);
   const manifest = Array.isArray(groupState.manifest) ? groupState.manifest : [];
   const paths = manifest.map((item) => (item && item.path ? item.path : null)).filter(Boolean);
   if (!paths.length) {
@@ -545,15 +641,12 @@ function handleThumbnailClick(event, groupKey, index) {
     return;
   }
   const path = button.dataset.path;
-  const wantsSelection = state.download.active || event.metaKey || event.ctrlKey;
-  if (wantsSelection && path) {
+  const wantsSelection = (event.metaKey || event.ctrlKey) && path;
+  if (wantsSelection) {
     event.preventDefault();
     event.stopPropagation();
     if (state.download.inProgress) {
       return;
-    }
-    if (!state.download.active) {
-      setDownloadMode(true);
     }
     toggleImageSelection(path, groupKey);
     return;
@@ -566,8 +659,8 @@ function handleThumbnailClick(event, groupKey, index) {
   openViewerAt(groupKey, index);
 }
 
-function clearDownloadSelection({ keepMode = false } = {}) {
-  resetDownloadState({ keepMode });
+function clearDownloadSelection() {
+  resetDownloadState();
 }
 
 function extractFilenameFromDisposition(header) {
@@ -638,7 +731,7 @@ async function initiateDownload() {
     anchor.click();
     document.body.removeChild(anchor);
     URL.revokeObjectURL(url);
-    clearDownloadSelection({ keepMode: state.download.active });
+    clearDownloadSelection();
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
     alert(`Unable to download images: ${message}`);
@@ -648,14 +741,9 @@ async function initiateDownload() {
   }
 }
 
-function handleDownloadToggleClick(event) {
-  event.preventDefault();
-  setDownloadMode(!state.download.active);
-}
-
 function handleDownloadClearClick(event) {
   event.preventDefault();
-  clearDownloadSelection({ keepMode: true });
+  clearDownloadSelection();
 }
 
 async function handleDownloadButtonClick(event) {
@@ -840,6 +928,7 @@ function normalizeRandomViewerFilters() {
       lastPath: null,
       nextChoice: null,
       pool: [],
+      queue: [],
       filter: {
         start: null,
         end: null,
@@ -970,6 +1059,8 @@ function stopRandomViewer({ resetToggle = true } = {}) {
   state.randomViewer.enabled = false;
   state.randomViewer.lastPath = null;
   state.randomViewer.pool = [];
+  state.randomViewer.queue = [];
+  state.randomViewer.queue = [];
   state.randomViewer.nextChoice = null;
   if (resetToggle && elements.randomViewerToggle) {
     elements.randomViewerToggle.checked = false;
@@ -1000,7 +1091,7 @@ function updateRandomViewerSettingsAvailability() {
   }
 }
 
-function buildRandomViewerPool() {
+async function buildRandomViewerPool() {
   const filter = normalizeRandomViewerFilters();
   const specificEntries = filter.specificList || [];
   const hasSpecific = specificEntries.length > 0;
@@ -1016,8 +1107,20 @@ function buildRandomViewerPool() {
     });
   });
 
-  state.imagesByGroup.forEach((items, groupKey) => {
-    items.forEach((item) => {
+  for (const [groupKey, subgroupMeta] of subgroupMap.entries()) {
+    ensureSubgroupRendered(groupKey);
+    const groupState = state.groups.get(groupKey);
+    if (!groupState) {
+      continue;
+    }
+    await ensureGroupManifestCount(groupState, groupState.total);
+    const manifest = Array.isArray(groupState.manifest) ? groupState.manifest : [];
+    const subgroupLabel = subgroupMeta ? (subgroupMeta.formattedLabel || subgroupMeta.label || "") : "";
+    const topKey = groupKey.split("/")[0] || groupKey;
+    const topGroup = topGroupMap.get(topKey);
+    const topLabelText = topGroup ? (topGroup.formattedLabel || topGroup.label || "") : "";
+
+    manifest.forEach((item) => {
       let dateValue = Number.isInteger(item.dateValue) ? item.dateValue : null;
       if (!dateValue) {
         dateValue = deriveDateValueFromItem(item);
@@ -1026,10 +1129,6 @@ function buildRandomViewerPool() {
         }
       }
       const isoValue = dateValue ? formatValueToDateString(dateValue) : null;
-      const subgroupMeta = subgroupMap.get(groupKey);
-      const subgroupLabel = subgroupMeta ? (subgroupMeta.formattedLabel || subgroupMeta.label || "") : "";
-      const topLabelMeta = topGroupMap.get(groupKey.split("/")[0] || "");
-      const topLabelText = topLabelMeta ? (topLabelMeta.formattedLabel || topLabelMeta.label || "") : "";
       const matchesSpecific = hasSpecific
         ? specificEntries.some((entry) => {
             if (entry.type === "date") {
@@ -1062,10 +1161,9 @@ function buildRandomViewerPool() {
               if (topLabelText && topLabelText.toLowerCase().includes(lowerTarget)) {
                 return true;
               }
-              const topKey = groupKey.split("/")[0];
-              const topGroup = topGroupMap.get(topKey);
-              if (topGroup) {
-                const topLabel = (topGroup.formattedLabel || topGroup.label || "").toLowerCase();
+              const topGroupMatch = topGroupMap.get(topKey);
+              if (topGroupMatch) {
+                const topLabel = (topGroupMatch.formattedLabel || topGroupMatch.label || "").toLowerCase();
                 if (topLabel.includes(lowerTarget)) {
                   return true;
                 }
@@ -1093,23 +1191,22 @@ function buildRandomViewerPool() {
         : hasRange
         ? matchesRange
         : true;
-      if (!include) {
-        return;
-      }
-      if (!item.path) {
+      if (!include || !item.path) {
         return;
       }
       pool.push({ path: item.path, groupKey, dateValue, isoValue });
     });
-  });
+  }
 
   state.randomViewer.pool = pool;
   return pool;
 }
 
-function refreshRandomViewerPool() {
+async function refreshRandomViewerPool() {
   state.randomViewer.nextChoice = null;
-  return buildRandomViewerPool();
+  const pool = await buildRandomViewerPool();
+  rebuildRandomViewerQueue(state.randomViewer.lastPath);
+  return pool;
 }
 
 function scheduleRandomViewerTick() {
@@ -1123,27 +1220,46 @@ function scheduleRandomViewerTick() {
   }, waitSeconds * 1000);
 }
 
-function pickRandomChoice(excludePath = null) {
+function rebuildRandomViewerQueue(excludePath = null) {
   const pool = state.randomViewer.pool || [];
-  if (!pool.length) {
+  if (!Array.isArray(pool) || !pool.length) {
+    state.randomViewer.queue = [];
+    return;
+  }
+  const items = shuffleArray(pool.slice());
+  if (excludePath && items.length > 1 && items[0].path === excludePath) {
+    const alternateIndex = items.findIndex((entry) => entry.path !== excludePath);
+    if (alternateIndex > 0) {
+      const [alternate] = items.splice(alternateIndex, 1);
+      items.unshift(alternate);
+    }
+  }
+  state.randomViewer.queue = items;
+}
+
+function drawNextRandomEntry(excludePath = null) {
+  let queue = state.randomViewer.queue || [];
+  if (!queue.length) {
+    rebuildRandomViewerQueue(excludePath);
+    queue = state.randomViewer.queue || [];
+  }
+  if (!queue.length) {
     return null;
   }
-  const filtered = excludePath
-    ? pool.filter((item) => item && item.path && item.path !== excludePath)
-    : pool.slice();
-  const source = filtered.length ? filtered : pool;
-  if (!source.length) {
+  let entry = queue.shift();
+  if (excludePath && entry && entry.path === excludePath && queue.length) {
+    queue.push(entry);
+    entry = queue.shift();
+  }
+  state.randomViewer.queue = queue;
+  if (!entry) {
     return null;
   }
-  const candidate = source[Math.floor(Math.random() * source.length)];
-  if (!candidate) {
-    return null;
-  }
-  return { path: candidate.path, groupKey: candidate.groupKey };
+  return { path: entry.path, groupKey: entry.groupKey };
 }
 
 function preloadRandomChoice(excludePath = null) {
-  const choice = pickRandomChoice(excludePath);
+  const choice = drawNextRandomEntry(excludePath);
   if (!choice) {
     state.randomViewer.nextChoice = null;
     return null;
@@ -1168,7 +1284,14 @@ async function runRandomViewerCycle() {
     return;
   }
   if (!state.randomViewer.pool.length) {
-    const pool = refreshRandomViewerPool();
+    let pool;
+    try {
+      pool = await refreshRandomViewerPool();
+    } catch (error) {
+      console.error("Failed to refresh random viewer pool", error);
+      stopRandomViewer();
+      return;
+    }
     if (!pool.length) {
       alert("No images match the current random viewer filters.");
       stopRandomViewer();
@@ -1206,7 +1329,7 @@ async function runRandomViewerCycle() {
   }
 }
 
-function startRandomViewer() {
+async function startRandomViewer() {
   normalizeRandomViewerFilters();
   if (elements.randomViewerDuration) {
     const currentValue = Number.parseInt(elements.randomViewerDuration.value, 10);
@@ -1220,7 +1343,21 @@ function startRandomViewer() {
       state.randomViewer.blend = blendValue;
     }
   }
-  const pool = refreshRandomViewerPool();
+  if (state.flyoutPinned) {
+    setFlyoutPinned(false);
+  }
+  if (state.controlOpen) {
+    closeControlPanel();
+  }
+  let pool;
+  try {
+    pool = await refreshRandomViewerPool();
+  } catch (error) {
+    console.error("Failed to build random viewer pool", error);
+    alert("Unable to prepare the random viewer just yet.");
+    stopRandomViewer({ resetToggle: true });
+    return;
+  }
   if (!pool.length) {
     alert("No images match the current filters for the random viewer.");
     stopRandomViewer({ resetToggle: true });
@@ -1229,6 +1366,7 @@ function startRandomViewer() {
   state.randomViewer.enabled = true;
   state.randomViewer.running = true;
   state.randomViewer.lastPath = null;
+  rebuildRandomViewerQueue(null);
   preloadRandomChoice(null);
   updateRandomViewerSettingsAvailability();
   setViewerNavDisabled(true);
@@ -1238,7 +1376,7 @@ function startRandomViewer() {
 function handleRandomViewerToggle(event) {
   const enabled = Boolean(event.target.checked);
   if (enabled) {
-    startRandomViewer();
+    startRandomViewer().catch((error) => console.error(error));
   } else {
     stopRandomViewer({ resetToggle: false });
   }
@@ -1255,7 +1393,7 @@ function updateRandomViewerDuration(event) {
   }
 }
 
-function updateRandomViewerRange() {
+async function updateRandomViewerRange() {
   let startValue = parseDateToValue(elements.randomViewerStart ? elements.randomViewerStart.value : "");
   let endValue = parseDateToValue(elements.randomViewerEnd ? elements.randomViewerEnd.value : "");
   if (startValue && endValue && endValue < startValue) {
@@ -1271,7 +1409,11 @@ function updateRandomViewerRange() {
   }
   state.randomViewer.filter.start = startValue;
   state.randomViewer.filter.end = endValue;
-  refreshRandomViewerPool();
+  try {
+    await refreshRandomViewerPool();
+  } catch (error) {
+    console.error("Failed to refresh random viewer pool", error);
+  }
   if (state.randomViewer.running) {
     preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
@@ -1310,7 +1452,7 @@ function renderRandomViewerChips() {
   });
 }
 
-function removeRandomViewerSpecificDate(key) {
+async function removeRandomViewerSpecificDate(key) {
   const filter = normalizeRandomViewerFilters();
   if (!filter || !filter.specificMap) {
     return;
@@ -1321,14 +1463,18 @@ function removeRandomViewerSpecificDate(key) {
   filter.specificMap.delete(key);
   filter.specificList = filter.specificList.filter((entry) => entry && entry.key !== key);
   renderRandomViewerChips();
-  refreshRandomViewerPool();
+  try {
+    await refreshRandomViewerPool();
+  } catch (error) {
+    console.error("Failed to refresh random viewer pool", error);
+  }
   if (state.randomViewer.running) {
     preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
   }
 }
 
-function addRandomViewerSpecificDate() {
+async function addRandomViewerSpecificDate() {
   const input = elements.randomViewerSpecificInput;
   if (!input) {
     return;
@@ -1352,7 +1498,7 @@ function addRandomViewerSpecificDate() {
   filter.specificList.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
   input.value = "";
   renderRandomViewerChips();
-  refreshRandomViewerPool();
+  await refreshRandomViewerPool();
   if (state.randomViewer.running) {
     preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
@@ -1582,13 +1728,8 @@ function deriveGroupKey(path) {
 async function fetchHierarchy() {
   setGlobalLoaderVisible(true);
   try {
-    const data = await fetchJson(`/api/hierarchy?order=${state.order}`);
+    const data = await fetchJson(`/api/groups?order=${state.order}`);
     resetStateForOrder();
-    const imagesByGroup = data.imagesByGroup || {};
-    state.imagesByGroup = new Map(
-      Object.entries(imagesByGroup).map(([key, list]) => [key, Array.isArray(list) ? list : []]),
-    );
-    refreshRandomViewerPool();
     state.topGroups = Array.isArray(data.groups) ? data.groups : [];
     buildTopGroupOptions(state.topGroups);
     renderNextTopGroups(GROUP_BATCH_SIZE);
@@ -1668,8 +1809,12 @@ function createSubgroup(topGroup, subgroup) {
   container.className = "subgroup-section";
   container.dataset.groupKey = subgroup.key;
 
-  const manifest = state.imagesByGroup.get(subgroup.key) || [];
-  const totalCount = manifest.length || subgroup.count || 0;
+  let manifest = state.imagesByGroup.get(subgroup.key);
+  if (!manifest) {
+    manifest = [];
+    state.imagesByGroup.set(subgroup.key, manifest);
+  }
+  const totalCount = typeof subgroup.count === "number" ? subgroup.count : manifest.length;
 
   if (totalCount > 0) {
     container.classList.add("pending-hydration");
@@ -1723,7 +1868,7 @@ function createSubgroup(topGroup, subgroup) {
     selectButton.textContent = "No photos";
     selectButton.disabled = true;
   } else {
-    selectButton.textContent = "Select group";
+    selectButton.textContent = "Select All";
   }
   actions.appendChild(selectButton);
   header.appendChild(actions);
@@ -1758,25 +1903,29 @@ function createSubgroup(topGroup, subgroup) {
     renderedCount: 0,
     pendingHydration: totalCount > 0,
     selectedCount: existingSelected,
+    nextCursor: null,
+    loading: null,
+    fullyLoaded: manifest.length >= totalCount && totalCount > 0,
   };
 
   state.groups.set(subgroup.key, groupState);
   state.groupSequence.push(subgroup.key);
 
   if (groupState.selectButton) {
-    groupState.selectButton.addEventListener("click", () => {
-      if (!state.download.active) {
-        setDownloadMode(true);
+    groupState.selectButton.addEventListener("click", async () => {
+      try {
+        await toggleGroupDownloadSelection(groupState.key);
+      } catch (error) {
+        console.error(`Failed to toggle selection for group ${groupState.key}`, error);
       }
-      toggleGroupDownloadSelection(groupState.key);
     });
   }
 
-  if (totalCount > 0) {
-    renderNextThumbnails(groupState, Math.min(THUMBNAILS_PER_GROUP, totalCount));
-  }
-
   updateGroupSelectionStatus(groupState.key);
+
+  if (groupState.total > 0) {
+    ensureGroupLoaded(groupState.key).catch((error) => console.error(error));
+  }
 
   return groupState;
 }
@@ -1789,11 +1938,16 @@ function updateGroupIndexMap() {
 }
 
 function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
-  if (!groupState || !groupState.manifest) {
+  if (!groupState) {
+    return;
+  }
+  groupState.manifest = state.imagesByGroup.get(groupState.key) || groupState.manifest || [];
+  const manifest = groupState.manifest;
+  if (!Array.isArray(manifest) || !manifest.length) {
     return;
   }
   const startIndex = groupState.renderedCount || 0;
-  const total = groupState.manifest.length;
+  const total = manifest.length;
   if (startIndex >= total) {
     return;
   }
@@ -1801,7 +1955,7 @@ function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
   const fragment = document.createDocumentFragment();
 
   for (let index = startIndex; index < endIndex; index += 1) {
-    const meta = groupState.manifest[index] || {};
+    const meta = manifest[index] || {};
     const button = document.createElement("button");
     button.type = "button";
     button.className = "thumbnail-button placeholder";
@@ -1809,7 +1963,7 @@ function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
     button.disabled = true;
     button.tabIndex = -1;
     button.setAttribute("aria-hidden", "true");
-    button.setAttribute("aria-pressed", "false");
+    button.setAttribute("aria-checked", "false");
     button.dataset.groupKey = groupState.key;
     button.dataset.index = String(index);
     if (meta.path) {
@@ -1820,9 +1974,31 @@ function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
       handleThumbnailClick(event, groupState.key, index);
     });
 
+    let entryRef = null;
     const indicator = document.createElement("span");
     indicator.className = "thumbnail-select-indicator";
-    indicator.setAttribute("aria-hidden", "true");
+    indicator.setAttribute("role", "checkbox");
+    indicator.setAttribute("aria-checked", "false");
+    indicator.setAttribute("aria-label", "Select for download");
+    indicator.setAttribute("tabindex", "0");
+    indicator.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!entryRef || !entryRef.path || state.download.inProgress) {
+        return;
+      }
+      toggleImageSelection(entryRef.path, groupState.key);
+    });
+    indicator.addEventListener("keydown", (event) => {
+      if (event.key === " " || event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!entryRef || !entryRef.path || state.download.inProgress) {
+          return;
+        }
+        toggleImageSelection(entryRef.path, groupState.key);
+      }
+    });
     button.appendChild(indicator);
 
     const tile = document.createElement("div");
@@ -1841,6 +2017,7 @@ function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
       loaded: false,
       loading: false,
     };
+    entryRef = entry;
     groupState.images[index] = entry;
     if (entry.path) {
       state.pathToImage.set(entry.path, { groupKey: groupState.key, index });
@@ -1873,10 +2050,22 @@ function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
 }
 
 function maybeRenderMoreThumbnails(groupState, viewport, margin) {
-  if (!groupState || !groupState.manifest) {
+  if (!groupState) {
     return;
   }
-  if (groupState.renderedCount >= groupState.manifest.length) {
+  groupState.manifest = state.imagesByGroup.get(groupState.key) || groupState.manifest || [];
+  const manifestLength = Array.isArray(groupState.manifest) ? groupState.manifest.length : 0;
+  if (groupState.renderedCount >= manifestLength) {
+    if (!groupState.fullyLoaded) {
+      ensureGroupManifestCount(groupState, groupState.renderedCount + THUMBNAILS_PER_GROUP)
+        .then(() => {
+          const updatedManifest = state.imagesByGroup.get(groupState.key) || [];
+          if (groupState.renderedCount < updatedManifest.length) {
+            renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
+          }
+        })
+        .catch((error) => console.error(error));
+    }
     return;
   }
   const lastElement = groupState.grid.lastElementChild;
@@ -2068,15 +2257,16 @@ function loadImageEntry(groupState, index) {
   entry.loading = false;
 }
 
-function ensureGroupLoaded(groupKey) {
+async function ensureGroupLoaded(groupKey, options = {}) {
   const groupState = state.groups.get(groupKey);
-  if (!groupState) {
-    return Promise.resolve();
+  if (!groupState || groupState.total === 0) {
+    return;
   }
-  if (groupState.renderedCount === 0) {
-    renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
+  const desiredCount = Math.max(options.minCount || THUMBNAILS_PER_GROUP, THUMBNAILS_PER_GROUP);
+  await ensureGroupManifestCount(groupState, desiredCount);
+  if (groupState.renderedCount === 0 && groupState.manifest.length) {
+    renderNextThumbnails(groupState, Math.min(THUMBNAILS_PER_GROUP, groupState.manifest.length));
   }
-  return Promise.resolve();
 }
 
 let scrollIdleHandle = null;
@@ -2105,7 +2295,7 @@ function loadVisibleGroups() {
     return;
   }
   visibleKeys.forEach((key) => {
-    ensureGroupLoaded(key);
+    ensureGroupLoaded(key).catch((error) => console.error(error));
     const groupState = state.groups.get(key);
     if (!groupState) {
       return;
@@ -2128,10 +2318,10 @@ function loadVisibleGroups() {
   const firstIndex = state.groupIndexMap.get(visibleKeys[0]);
   const lastIndex = state.groupIndexMap.get(visibleKeys[visibleKeys.length - 1]);
   if (firstIndex !== undefined && firstIndex > 0) {
-    ensureGroupLoaded(state.groupSequence[firstIndex - 1]);
+    ensureGroupLoaded(state.groupSequence[firstIndex - 1]).catch((error) => console.error(error));
   }
   if (lastIndex !== undefined && lastIndex + 1 < state.groupSequence.length) {
-    ensureGroupLoaded(state.groupSequence[lastIndex + 1]);
+    ensureGroupLoaded(state.groupSequence[lastIndex + 1]).catch((error) => console.error(error));
   }
   state.topGroupStatus.forEach((meta) => {
     if (!meta || !meta.section) {
@@ -2565,7 +2755,7 @@ function applyOrder(order, { updateUrl = false } = {}) {
 function preloadInitialGroups() {
   const keys = state.groupSequence.slice(0, INITIAL_PREFETCH_GROUPS);
   keys.forEach((key) => {
-    ensureGroupLoaded(key);
+    ensureGroupLoaded(key).catch((error) => console.error(error));
   });
   scheduleViewportLoading();
 }
@@ -2643,10 +2833,14 @@ elements.searchResults.addEventListener("click", async (event) => {
     return;
   }
   entry.container.scrollIntoView({ behavior: "smooth", block: "start" });
-  await ensureGroupLoaded(key);
+  try {
+    await ensureGroupLoaded(key);
+  } catch (error) {
+    console.error(error);
+  }
   const nextKey = getAdjacentGroupKey(key, 1);
   if (nextKey) {
-    ensureGroupLoaded(nextKey);
+    ensureGroupLoaded(nextKey).catch((error) => console.error(error));
   }
   scheduleViewportLoading();
   closeControlPanel();
@@ -2673,8 +2867,11 @@ if (elements.yearNavigationButtons) {
     if (!target || !target.dataset.topKey) {
       return;
     }
-    navigateToTopGroup(target.dataset.topKey);
+    const topKey = target.dataset.topKey;
     closeControlPanel();
+    requestAnimationFrame(() => {
+      navigateToTopGroup(topKey);
+    });
   });
 }
 
@@ -2688,10 +2885,6 @@ if (elements.yearNavigationSelect) {
     event.target.selectedIndex = 0;
     closeControlPanel();
   });
-}
-
-if (elements.downloadToggle) {
-  elements.downloadToggle.addEventListener("click", handleDownloadToggleClick);
 }
 
 if (elements.downloadClear) {
@@ -2908,7 +3101,16 @@ function showHeader() {
   headerShownRecently = true;
 }
 
-function hideHeaderIfIdle() {
+function hideHeaderIfIdle(event) {
+  if (event && elements.header) {
+    const nextTarget = event.relatedTarget;
+    if (!nextTarget) {
+      return;
+    }
+    if (elements.header.contains(nextTarget)) {
+      return;
+    }
+  }
   headerHover = false;
   if (state.flyoutPinned) {
     return;
@@ -2955,10 +3157,9 @@ if (elements.flyoutHandle) {
     setHeaderCollapsed(false);
   });
 
-  elements.flyoutHandle.addEventListener("mouseleave", () => {
-    headerHover = false;
+  elements.flyoutHandle.addEventListener("mouseleave", (event) => {
     if (!state.controlOpen) {
-      hideHeaderIfIdle();
+      hideHeaderIfIdle(event);
     }
   });
 
@@ -3009,10 +3210,6 @@ document.addEventListener("keydown", async (event) => {
     }
     if (state.controlOpen) {
       closeControlPanel();
-      return;
-    }
-    if (state.download.active && !state.download.inProgress) {
-      setDownloadMode(false);
       return;
     }
     if (state.flyoutPinned) {

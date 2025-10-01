@@ -142,7 +142,11 @@ def _relative_path_from_id(value: object) -> Optional[str]:
     return normalized or None
 
 
-def _aggregate_documents(match: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]:
+def _aggregate_documents(
+    match: Optional[Dict[str, object]] = None,
+    post_match: Optional[Dict[str, object]] = None,
+    sort_direction: int = -1,
+) -> List[Dict[str, object]]:
     collection = MONGO_COLLECTION
     if collection is None:
         return []
@@ -244,9 +248,13 @@ def _aggregate_documents(match: Optional[Dict[str, object]] = None) -> List[Dict
                     "dateValue": 1,
                 }
             },
-            {"$sort": {"dateValue": -1, "relative": 1}},
         ]
     )
+
+    if post_match:
+        pipeline.append({"$match": post_match})
+
+    pipeline.append({"$sort": {"dateValue": sort_direction, "relative": 1}})
 
     try:
         db_obj = getattr(MONGO_COLLECTION, "database", None)
@@ -743,6 +751,54 @@ def _build_manifest_entry(
     return manifest_entry, has_date, date_value
 
 
+def _accumulate_documents(
+    documents: List[Dict[str, object]],
+    *,
+    include_images: bool = True,
+    group_filter: Optional[str] = None,
+) -> Tuple[Dict[str, Dict[str, object]], Dict[str, Counter], Optional[Dict[str, List[Dict[str, object]]]]]:
+    top_groups: Dict[str, Dict[str, object]] = {}
+    location_counts: Dict[str, Counter] = {}
+    images_by_group: Optional[Dict[str, List[Dict[str, object]]]] = {} if include_images else None
+
+    for doc in documents:
+        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
+        if not relative:
+            continue
+        rel_path = PurePosixPath(relative)
+        parts = rel_path.parts
+        if not parts:
+            continue
+
+        top_key = str(doc.get("topKey") or parts[0])
+        top_label = top_key
+        if len(parts) >= 2:
+            subgroup_key = str(doc.get("subgroupKey") or f"{parts[0]}/{parts[1]}")
+            subgroup_label = str(doc.get("subgroupLabel") or parts[1])
+        else:
+            subgroup_key = str(doc.get("subgroupKey") or top_key)
+            subgroup_label = str(doc.get("subgroupLabel") or top_label)
+
+        if group_filter and subgroup_key != group_filter:
+            continue
+
+        manifest_entry, has_date, date_value = _build_manifest_entry(
+            rel_path, relative, subgroup_label, doc
+        )
+
+        if include_images and images_by_group is not None:
+            images_by_group.setdefault(subgroup_key, []).append(manifest_entry)
+
+        top_entry = _update_group_summary(top_groups, top_key, top_label, has_date, date_value)
+        _update_group_summary(top_entry["subgroups"], subgroup_key, subgroup_label, has_date, date_value)
+
+        location_label = _format_location_label(doc.get("location"))
+        if location_label:
+            location_counts.setdefault(subgroup_key, Counter())[location_label] += 1
+
+    return top_groups, location_counts, images_by_group
+
+
 def _update_group_summary(
     summary: Dict[str, object],
     key: str,
@@ -815,50 +871,60 @@ def _finalize_top_groups(
     return top_group_list
 
 
-def _build_hierarchy_db() -> Dict[str, object]:
+def _order_groups(top_groups: Sequence[Dict[str, object]], order: str) -> List[Dict[str, object]]:
+    normalized = order if order in {"asc", "desc"} else "desc"
+    reverse = normalized == "desc"
+
+    ordered_groups: List[Dict[str, object]] = []
+    for group in sorted(
+        top_groups,
+        key=lambda item: (item.get("dateValue", 0), item.get("key")),
+        reverse=reverse,
+    ):
+        subgroups = group.get("subgroups", []) or []
+        subgroups_ordered = sorted(
+            subgroups,
+            key=lambda item: (item.get("dateValue", 0), item.get("key")),
+            reverse=reverse,
+        )
+        ordered_groups.append(
+            {
+                "key": group.get("key"),
+                "label": group.get("label"),
+                "formattedLabel": group.get("formattedLabel"),
+                "count": group.get("count", 0),
+                "dateValue": group.get("dateValue", 0),
+                "subgroups": subgroups_ordered,
+            }
+        )
+
+    return ordered_groups
+
+
+def _build_hierarchy_db(include_images: bool = True) -> Dict[str, object]:
     documents = _fetch_database_documents()
-    top_groups: Dict[str, Dict[str, object]] = {}
-    images_by_group: Dict[str, List[Dict[str, object]]] = {}
-    location_counts: Dict[str, Counter] = {}
+    top_groups, location_counts, images_by_group = _accumulate_documents(
+        documents,
+        include_images=include_images,
+    )
 
-    for doc in documents:
-        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
-        if not relative:
-            continue
-        rel_path = PurePosixPath(relative)
-        top_key = str(doc.get("topKey") or rel_path.parts[0])
-        top_label = top_key
-        subgroup_key = str(doc.get("subgroupKey") or top_key)
-        subgroup_label = str(doc.get("subgroupLabel") or top_label)
-        manifest_entry, has_date, date_value = _build_manifest_entry(
-            rel_path, relative, subgroup_label, doc
-        )
+    if include_images and images_by_group is not None:
+        for manifest in images_by_group.values():
+            manifest.sort(
+                key=lambda item: (
+                    1 if item.get("hasDate") else 0,
+                    item.get("dateValue", 0),
+                    (item.get("path") or "").lower(),
+                ),
+                reverse=True,
+            )
 
-        images_by_group.setdefault(subgroup_key, []).append(manifest_entry)
-        top_entry = _update_group_summary(top_groups, top_key, top_label, has_date, date_value)
-        subgroup_summary = _update_group_summary(
-            top_entry["subgroups"], subgroup_key, subgroup_label, has_date, date_value
-        )
-
-        location_label = _format_location_label(doc.get("location"))
-        if location_label:
-            location_counts.setdefault(subgroup_key, Counter())[location_label] += 1
-
-    for manifest in images_by_group.values():
-        manifest.sort(
-            key=lambda item: (
-                1 if item.get("hasDate") else 0,
-                item.get("dateValue", 0),
-                (item.get("path") or "").lower(),
-            ),
-            reverse=True,
-        )
-
-    hierarchy = {
+    result: Dict[str, object] = {
         "top_groups": _finalize_top_groups(top_groups, location_counts),
-        "images_by_group": images_by_group,
     }
-    return hierarchy
+    if include_images and images_by_group is not None:
+        result["images_by_group"] = images_by_group
+    return result
 
 
 def build_hierarchy(root: Path) -> Dict[str, object]:
@@ -990,34 +1056,22 @@ def build_hierarchy(root: Path) -> Dict[str, object]:
 
 
 def hierarchy_payload(root: Path, order: str) -> Dict[str, object]:
-    data = build_hierarchy(root)
-    top_groups = data["top_groups"]
-    images_by_group = data["images_by_group"]
-    reverse = order == "desc"
+    normalized = order.lower()
+    if normalized not in {"asc", "desc"}:
+        normalized = "desc"
 
-    ordered_groups: List[Dict[str, object]] = []
-    for group in sorted(
-        top_groups, key=lambda item: (item["dateValue"], item["key"]), reverse=reverse
-    ):
-        subgroups_ordered = sorted(
-            group["subgroups"],
-            key=lambda item: (item["dateValue"], item["key"]),
-            reverse=reverse,
-        )
-        ordered_groups.append(
-            {
-                "key": group["key"],
-                "label": group["label"],
-                "formattedLabel": group.get("formattedLabel"),
-                "count": group["count"],
-                "dateValue": group["dateValue"],
-                "subgroups": subgroups_ordered,
-            }
-        )
+    if using_database():
+        data = _build_hierarchy_db(include_images=True)
+    else:
+        data = build_hierarchy(root)
+
+    top_groups = data["top_groups"]
+    ordered_groups = _order_groups(top_groups, normalized)
+    images_by_group = data.get("images_by_group", {}) or {}
 
     images_payload: Dict[str, List[Dict[str, object]]] = {}
     for group_key, image_list in images_by_group.items():
-        sequence = image_list if reverse else list(reversed(image_list))
+        sequence = image_list if normalized == "desc" else list(reversed(image_list))
         images_payload[group_key] = [
             {
                 "name": item.get("name"),
@@ -1031,8 +1085,24 @@ def hierarchy_payload(root: Path, order: str) -> Dict[str, object]:
     return {
         "groups": ordered_groups,
         "imagesByGroup": images_payload,
-        "order": order,
+        "order": normalized,
     }
+
+
+def groups_payload(root: Path, order: str) -> Dict[str, object]:
+    normalized = order.lower()
+    if normalized not in {"asc", "desc"}:
+        normalized = "desc"
+
+    if using_database():
+        data = _build_hierarchy_db(include_images=False)
+        top_groups = data.get("top_groups", [])
+    else:
+        data = build_hierarchy(root)
+        top_groups = data["top_groups"]
+
+    ordered_groups = _order_groups(top_groups, normalized)
+    return {"groups": ordered_groups, "order": normalized}
 
 
 def group_images_payload(
@@ -1042,12 +1112,19 @@ def group_images_payload(
     limit: int,
     order: str,
 ) -> Dict[str, object]:
+    normalized = order.lower()
+    if normalized not in {"asc", "desc"}:
+        normalized = "desc"
+
+    if using_database():
+        return _group_images_payload_db(group_key, cursor, limit, normalized)
+
     data = build_hierarchy(root)
     images = data["images_by_group"].get(group_key)
     if images is None:
         return {"images": [], "nextCursor": None}
 
-    sequence = images if order == "desc" else list(reversed(images))
+    sequence = images if normalized == "desc" else list(reversed(images))
     start_index = 0
     if cursor:
         cursor = cursor.replace(os.sep, "/")
@@ -1065,6 +1142,7 @@ def group_images_payload(
             "name": item["name"],
             "path": item["path"],
             "dateHint": item.get("dateHint"),
+            "dateValue": item.get("dateValue"),
         }
         for item in slice_items
     ]
@@ -1072,6 +1150,69 @@ def group_images_payload(
     next_cursor = None
     if start_index + len(slice_items) < len(sequence):
         next_cursor = slice_items[-1]["path"]
+
+    return {"images": response_images, "nextCursor": next_cursor}
+
+
+def _group_images_payload_db(
+    group_key: str,
+    cursor: Optional[str],
+    limit: int,
+    order: str,
+) -> Dict[str, object]:
+    sort_direction = -1 if order == "desc" else 1
+    documents = _aggregate_documents(post_match={"subgroupKey": group_key}, sort_direction=sort_direction)
+    if not documents:
+        return {"images": [], "nextCursor": None}
+
+    manifest: List[Dict[str, object]] = []
+    for doc in documents:
+        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
+        if not relative:
+            continue
+        rel_path = PurePosixPath(relative)
+        parts = rel_path.parts
+        subgroup_label = str(doc.get("subgroupLabel") or (parts[1] if len(parts) >= 2 else parts[0]))
+        manifest_entry, _has_date, _date_value = _build_manifest_entry(rel_path, relative, subgroup_label, doc)
+        manifest.append(manifest_entry)
+
+    manifest.sort(
+        key=lambda item: (
+            1 if item.get("hasDate") else 0,
+            item.get("dateValue", 0),
+            (item.get("path") or "").lower(),
+        ),
+        reverse=True,
+    )
+    if order == "asc":
+        manifest = list(reversed(manifest))
+
+    start_index = 0
+    if cursor:
+        cursor_normalized = cursor.replace("\\", "/")
+        for idx, item in enumerate(manifest):
+            if item.get("path") == cursor_normalized:
+                start_index = idx + 1
+                break
+
+    slice_items = manifest[start_index : start_index + limit]
+    if not slice_items:
+        return {"images": [], "nextCursor": None}
+
+    next_cursor = None
+    if start_index + len(slice_items) < len(manifest):
+        next_cursor = slice_items[-1].get("path")
+
+    response_images = [
+        {
+            "name": item.get("name"),
+            "path": item.get("path"),
+            "dateHint": item.get("dateHint"),
+            "dateValue": item.get("dateValue"),
+        }
+        for item in slice_items
+        if item.get("path")
+    ]
 
     return {"images": response_images, "nextCursor": next_cursor}
 
@@ -1178,6 +1319,8 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.api_thumbnail(params)
             elif route == "/api/search":
                 self.api_search(params)
+            elif route == "/api/groups":
+                self.api_groups(params)
             elif route == "/api/hierarchy":
                 self.api_hierarchy(params)
             elif route == "/api/group-images":
@@ -1373,6 +1516,13 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         query = params.get("query", [""])[0]
         results = search_directories(self.root_path, query, limit=75)
         self.send_json({"results": results})
+
+    def api_groups(self, params: Dict[str, List[str]]) -> None:
+        order = params.get("order", ["desc"])[0].lower()
+        if order not in {"asc", "desc"}:
+            order = "desc"
+        payload = groups_payload(self.root_path, order)
+        self.send_json(payload)
 
     def api_hierarchy(self, params: Dict[str, List[str]]) -> None:
         order = params.get("order", ["desc"])[0].lower()
