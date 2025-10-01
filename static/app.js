@@ -196,6 +196,21 @@ function renderYearNavigation(options = []) {
   }
 
   const items = Array.isArray(options) ? options.filter((item) => item && item.key) : [];
+  items.sort((a, b) => {
+    const aValue = typeof a.dateValue === "number" ? a.dateValue : 0;
+    const bValue = typeof b.dateValue === "number" ? b.dateValue : 0;
+    const aHasDate = aValue > 0;
+    const bHasDate = bValue > 0;
+    if (aHasDate !== bHasDate) {
+      return aHasDate ? -1 : 1;
+    }
+    if (aHasDate && aValue !== bValue) {
+      return bValue - aValue;
+    }
+    const aLabel = (a.label || "").toString();
+    const bLabel = (b.label || "").toString();
+    return bLabel.localeCompare(aLabel, undefined, { numeric: true, sensitivity: "base" });
+  });
   if (!items.length) {
     nav.hidden = true;
     return;
@@ -243,10 +258,17 @@ function buildTopGroupOptions(groups) {
     dateValue: typeof group.dateValue === "number" ? group.dateValue : 0,
   }));
   options.sort((a, b) => {
-    if (a.dateValue !== b.dateValue) {
-      return b.dateValue - a.dateValue;
+    const aValue = typeof a.dateValue === "number" ? a.dateValue : 0;
+    const bValue = typeof b.dateValue === "number" ? b.dateValue : 0;
+    const aHasDate = aValue > 0;
+    const bHasDate = bValue > 0;
+    if (aHasDate !== bHasDate) {
+      return aHasDate ? -1 : 1;
     }
-    return b.label.localeCompare(a.label, undefined, { numeric: true, sensitivity: "base" });
+    if (aHasDate && aValue !== bValue) {
+      return bValue - aValue;
+    }
+    return (b.label || "").localeCompare(a.label || "", undefined, { numeric: true, sensitivity: "base" });
   });
   state.topGroupOptions = options;
   state.combobox.filtered = options.slice();

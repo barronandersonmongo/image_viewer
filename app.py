@@ -23,11 +23,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 from PIL import Image, ImageOps
 
 try:  # Optional dependency for MongoDB metadata support
-    from pymongo import MongoClient
+    from pymongo import ASCENDING, DESCENDING, MongoClient
     from pymongo.collection import Collection
 except ImportError:  # pragma: no cover - pymongo may be absent in some environments
     MongoClient = None
     Collection = None
+    ASCENDING = 1
+    DESCENDING = -1
 
 SUPPORTED_EXTENSIONS = {
     ".jpg",
@@ -64,46 +66,10 @@ _IMAGE_CACHE: Dict[str, object] = {
 
 MONGO_COLLECTION: Optional["Collection"] = None
 
-_DB_CACHE: Dict[str, object] = {
-    "signature": None,
-    "documents": None,
-    "documents_generated": 0.0,
-    "paths": [],
-    "paths_generated": 0.0,
-    "hierarchy": None,
-    "hierarchy_generated": 0.0,
-}
-
-
-def _reset_db_cache() -> None:
-    _DB_CACHE.update(
-        {
-            "signature": None,
-            "documents": None,
-            "documents_generated": 0.0,
-            "paths": [],
-            "paths_generated": 0.0,
-            "hierarchy": None,
-            "hierarchy_generated": 0.0,
-        }
-    )
-
-
-def _current_db_signature() -> Optional[str]:
-    collection = MONGO_COLLECTION
-    if collection is None:
-        return None
-    try:
-        name = collection.full_name  # type: ignore[attr-defined]
-    except Exception:
-        name = None
-    return name or f"collection:{id(collection)}"
-
 
 def set_database_collection(collection: Optional["Collection"]) -> None:
     global MONGO_COLLECTION
     MONGO_COLLECTION = collection
-    _reset_db_cache()
 
 
 mimetypes.add_type("application/javascript", ".js")
@@ -175,6 +141,127 @@ def _relative_path_from_id(value: object) -> Optional[str]:
     normalized = value.replace("\\", "/").lstrip("/").strip()
     return normalized or None
 
+
+def _aggregate_documents(match: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]:
+    collection = MONGO_COLLECTION
+    if collection is None:
+        return []
+
+    pipeline: List[Dict[str, object]] = []
+    if match:
+        pipeline.append({"$match": match})
+
+    pipeline.extend(
+        [
+            {
+                "$project": {
+                    "_id": 1,
+                    "image_datetime": 1,
+                    "date_specific": 1,
+                    "location": 1,
+                    "relative_raw": {"$trim": {"input": "$_id", "chars": "/"}},
+                }
+            },
+            {
+                "$addFields": {
+                    "parts_all": {
+                        "$filter": {
+                            "input": {"$split": ["$relative_raw", "/"]},
+                            "cond": {"$ne": ["$$this", ""]},
+                        }
+                    }
+                }
+            },
+            {
+                "$addFields": {
+                    "topKey": {"$arrayElemAt": ["$parts_all", 0]},
+                    "subgroupKey": {
+                        "$cond": [
+                            {"$gte": [{"$size": "$parts_all"}, 2]},
+                            {
+                                "$concat": [
+                                    {"$arrayElemAt": ["$parts_all", 0]},
+                                    "/",
+                                    {"$arrayElemAt": ["$parts_all", 1]},
+                                ]
+                            },
+                            {"$arrayElemAt": ["$parts_all", 0]},
+                        ]
+                    },
+                    "subgroupLabel": {
+                        "$cond": [
+                            {"$gte": [{"$size": "$parts_all"}, 2]},
+                            {"$arrayElemAt": ["$parts_all", 1]},
+                            {"$arrayElemAt": ["$parts_all", 0]},
+                        ]
+                    },
+                }
+            },
+            {"$addFields": {"relative": "$relative_raw"}},
+            {
+                "$addFields": {
+                    "dateValue": {
+                        "$let": {
+                            "vars": {
+                                "dt": {
+                                    "$convert": {
+                                        "input": "$image_datetime",
+                                        "to": "date",
+                                        "onError": None,
+                                        "onNull": None,
+                                    }
+                                }
+                            },
+                            "in": {
+                                "$cond": [
+                                    {"$ifNull": ["$$dt", False]},
+                                    {
+                                        "$toInt": {
+                                            "$dateToString": {
+                                                "format": "%Y%m%d",
+                                                "date": "$$dt",
+                                                "timezone": "UTC",
+                                            }
+                                        }
+                                    },
+                                    0,
+                                ]
+                            },
+                        }
+                    }
+                }
+            },
+            {
+                "$project": {
+                    "_id": 1,
+                    "relative": 1,
+                    "topKey": 1,
+                    "subgroupKey": 1,
+                    "subgroupLabel": 1,
+                    "image_datetime": 1,
+                    "date_specific": 1,
+                    "location": 1,
+                    "dateValue": 1,
+                }
+            },
+            {"$sort": {"dateValue": -1, "relative": 1}},
+        ]
+    )
+
+    try:
+        db_obj = getattr(MONGO_COLLECTION, "database", None)
+        db_name = getattr(db_obj, "name", None) or "<db>"
+        coll_name = getattr(MONGO_COLLECTION, "name", None) or "<collection>"
+        pipeline_str = json.dumps(pipeline, indent=2)
+        print(
+            "[DB] mongo shell copy/paste:\n"
+            f"use {db_name};\n"
+            f"db.{coll_name}.aggregate({pipeline_str});"
+        )
+        return list(MONGO_COLLECTION.aggregate(pipeline, allowDiskUse=True))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Mongo aggregation failed: {exc}")
+        return []
 
 def _date_value_from_iso(value: object) -> Optional[int]:
     if isinstance(value, datetime):
@@ -255,42 +342,11 @@ def _format_location_label(location: object) -> Optional[str]:
 
 
 def _fetch_database_documents() -> List[Dict[str, object]]:
-    collection = MONGO_COLLECTION
-    if collection is None:
-        return []
-
-    signature = _current_db_signature()
-    now = time.time()
-    documents_cached = _DB_CACHE.get("documents")
-    if (
-        signature
-        and _DB_CACHE.get("signature") == signature
-        and isinstance(documents_cached, list)
-        and now - float(_DB_CACHE.get("documents_generated", 0.0)) < IMAGE_CACHE_TTL_SECONDS
-    ):
-        return documents_cached  # type: ignore[return-value]
-
-    projection = {
-        "_id": 1,
-        "image_datetime": 1,
-        "date_specific": 1,
-        "location": 1,
-    }
-    cursor = collection.find({}, projection)
-    documents: List[Dict[str, object]] = []
-    for doc in cursor:
-        record: Dict[str, object] = {
-            "_id": doc.get("_id"),
-            "image_datetime": doc.get("image_datetime"),
-            "date_specific": doc.get("date_specific"),
-        }
-        if "location" in doc:
-            record["location"] = doc.get("location")
-        documents.append(record)
-
-    _DB_CACHE["signature"] = signature
-    _DB_CACHE["documents"] = documents
-    _DB_CACHE["documents_generated"] = now
+    documents = _aggregate_documents()
+    for doc in documents:
+        relative = doc.get("relative")
+        if not isinstance(relative, str):
+            doc["relative"] = _relative_path_from_id(doc.get("_id"))
     return documents
 
 def build_breadcrumbs(root: Path, target: Path) -> List[Dict[str, str]]:
@@ -523,51 +579,41 @@ def sanitize_zip_component(component: str, fallback: str = "item") -> str:
     return cleaned
 
 
+def _is_year_label(text: object) -> bool:
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    return len(stripped) == 4 and stripped.isdigit()
+
+
 def _sorted_image_paths_db(order: str) -> List[str]:
-    signature = _current_db_signature()
-    now = time.time()
-    cached_paths = _DB_CACHE.get("paths")
-    if (
-        signature
-        and _DB_CACHE.get("signature") == signature
-        and isinstance(cached_paths, list)
-        and now - float(_DB_CACHE.get("paths_generated", 0.0)) < IMAGE_CACHE_TTL_SECONDS
-    ):
-        cache_paths = list(cached_paths)
-    else:
-        documents = _fetch_database_documents()
-        dated: List[tuple[int, str]] = []
-        undated: List[str] = []
-        for doc in documents:
-            relative = _relative_path_from_id(doc.get("_id"))
-            if not relative:
-                continue
-            rel_path = PurePosixPath(relative)
-            date_value = _date_value_from_iso(doc.get("image_datetime"))
-            has_date = bool(date_value and doc.get("date_specific", True))
-            if not date_value:
-                has_date, date_value_candidate = _extract_date_value(rel_path)
-                if has_date:
-                    date_value = date_value_candidate
-            if has_date and date_value:
-                dated.append((date_value, relative))
-            else:
-                undated.append(relative)
+    documents = _fetch_database_documents()
+    dated: List[tuple[int, str]] = []
+    undated: List[str] = []
+    for doc in documents:
+        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
+        if not relative:
+            continue
+        rel_path = PurePosixPath(relative)
+        subgroup_label = str(doc.get("subgroupLabel") or rel_path.parent.name or rel_path.name)
+        _manifest, has_date, date_value = _build_manifest_entry(
+            rel_path, relative, subgroup_label, doc
+        )
+        if has_date and date_value:
+            dated.append((date_value, relative))
+        else:
+            undated.append(relative)
 
-        dated.sort(key=lambda item: (item[0], item[1].lower()))
-        undated.sort(key=lambda path: path.lower())
-        cache_paths = [path for _value, path in dated] + undated
-
-        _DB_CACHE["signature"] = signature
-        _DB_CACHE["paths"] = cache_paths
-        _DB_CACHE["paths_generated"] = now
+    dated.sort(key=lambda item: (item[0], item[1].lower()))
+    undated.sort(key=lambda path: path.lower())
+    ordered = [path for _value, path in dated] + undated
 
     if order == "asc":
-        return list(cache_paths)
+        return ordered
 
     dated_paths = []
     undated_paths = []
-    for path in cache_paths:
+    for path in ordered:
         has_date, _ = _extract_date_value(PurePosixPath(path))
         if has_date:
             dated_paths.append(path)
@@ -668,93 +714,138 @@ def timeline_sections(
     return {"sections": sections, "nextCursor": next_cursor}
 
 
-def _build_hierarchy_db() -> Dict[str, object]:
-    signature = _current_db_signature()
-    now = time.time()
-    cached_hierarchy = _DB_CACHE.get("hierarchy")
-    if (
-        signature
-        and _DB_CACHE.get("signature") == signature
-        and isinstance(cached_hierarchy, dict)
-        and now - float(_DB_CACHE.get("hierarchy_generated", 0.0)) < IMAGE_CACHE_TTL_SECONDS
-    ):
-        return cached_hierarchy  # type: ignore[return-value]
+def _build_manifest_entry(
+    rel_path: PurePosixPath,
+    relative: str,
+    subgroup_label: str,
+    doc: Dict[str, object],
+) -> Tuple[Dict[str, object], bool, int]:
+    date_value = int(doc.get("dateValue") or 0)
+    has_date = bool(date_value and doc.get("date_specific", True))
+    if not date_value:
+        iso_value = _date_value_from_iso(doc.get("image_datetime"))
+        if iso_value:
+            date_value = iso_value
+            has_date = bool(doc.get("date_specific", True))
+    if not date_value:
+        extracted_has_date, extracted_value = _extract_date_value(rel_path)
+        if extracted_has_date:
+            has_date = True
+            date_value = extracted_value
+    date_hint = guess_date_hint(Path(rel_path)) or subgroup_label
+    manifest_entry = {
+        "name": rel_path.name,
+        "path": relative,
+        "dateHint": date_hint,
+        "dateValue": date_value,
+        "hasDate": has_date,
+    }
+    return manifest_entry, has_date, date_value
 
+
+def _update_group_summary(
+    summary: Dict[str, object],
+    key: str,
+    label: str,
+    has_date: bool,
+    date_value: int,
+) -> Dict[str, object]:
+    record = summary.setdefault(
+        key,
+        {
+            "key": key,
+            "label": label,
+            "count": 0,
+            "maxDate": 0,
+            "subgroups": {},
+        },
+    )
+    record["count"] = int(record.get("count", 0)) + 1
+    if has_date:
+        record["maxDate"] = max(int(record.get("maxDate", 0)), date_value)
+    return record
+
+
+def _finalize_top_groups(
+    top_groups: Dict[str, Dict[str, object]],
+    location_counts: Dict[str, Counter],
+) -> List[Dict[str, object]]:
+    top_group_list: List[Dict[str, object]] = []
+    for top_entry in top_groups.values():
+        subgroups_values = top_entry["subgroups"].values()
+        subgroups_payload: List[Dict[str, object]] = []
+        for sub in subgroups_values:
+            max_date_value = int(sub.get("maxDate", 0))
+            formatted_label = (
+                format_date_value(max_date_value)
+                or format_display_date(str(sub.get("label")))
+                or str(sub.get("label"))
+            )
+            payload: Dict[str, object] = {
+                "key": sub["key"],
+                "label": sub["label"],
+                "formattedLabel": formatted_label,
+                "count": sub["count"],
+                "dateValue": max_date_value,
+            }
+            counter = location_counts.get(sub["key"])
+            if counter:
+                payload["location"] = counter.most_common(1)[0][0]
+            subgroups_payload.append(payload)
+        subgroups_payload.sort(
+            key=lambda item: (item["dateValue"], item["key"]), reverse=True
+        )
+        formatted_top_label = (
+            format_display_date(str(top_entry["label"]))
+            or str(top_entry["label"])
+        )
+        if not _is_year_label(top_entry["label"]):
+            top_entry["maxDate"] = 0
+        top_group_list.append(
+            {
+                "key": top_entry["key"],
+                "label": top_entry["label"],
+                "formattedLabel": formatted_top_label,
+                "count": top_entry["count"],
+                "dateValue": top_entry["maxDate"],
+                "subgroups": subgroups_payload,
+            }
+        )
+    top_group_list.sort(key=lambda item: (item["dateValue"], item["key"]), reverse=True)
+    return top_group_list
+
+
+def _build_hierarchy_db() -> Dict[str, object]:
     documents = _fetch_database_documents()
     top_groups: Dict[str, Dict[str, object]] = {}
     images_by_group: Dict[str, List[Dict[str, object]]] = {}
     location_counts: Dict[str, Counter] = {}
 
     for doc in documents:
-        relative = _relative_path_from_id(doc.get("_id"))
+        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
         if not relative:
             continue
         rel_path = PurePosixPath(relative)
-        parts = rel_path.parts
-        if not parts:
-            continue
-
-        top_key = parts[0]
+        top_key = str(doc.get("topKey") or rel_path.parts[0])
         top_label = top_key
-        if len(parts) >= 2:
-            subgroup_key = f"{parts[0]}/{parts[1]}"
-            subgroup_label = parts[1]
-        else:
-            subgroup_key = top_key
-            subgroup_label = top_label
-
-        date_value = _date_value_from_iso(doc.get("image_datetime")) or 0
-        has_date = bool(date_value and doc.get("date_specific", True))
-        if not date_value:
-            extracted_has_date, extracted_value = _extract_date_value(rel_path)
-            if extracted_has_date:
-                has_date = True
-                date_value = extracted_value
-
-        date_hint = guess_date_hint(Path(rel_path)) or subgroup_label
-        image_item = {
-            "name": rel_path.name,
-            "path": relative,
-            "dateHint": date_hint,
-            "dateValue": date_value,
-            "hasDate": has_date,
-        }
-        images_by_group.setdefault(subgroup_key, []).append(image_item)
-
-        top_entry = top_groups.setdefault(
-            top_key,
-            {
-                "key": top_key,
-                "label": top_label,
-                "count": 0,
-                "maxDate": 0,
-                "subgroups": {},
-            },
+        subgroup_key = str(doc.get("subgroupKey") or top_key)
+        subgroup_label = str(doc.get("subgroupLabel") or top_label)
+        manifest_entry, has_date, date_value = _build_manifest_entry(
+            rel_path, relative, subgroup_label, doc
         )
-        top_entry["count"] = int(top_entry.get("count", 0)) + 1
-        if has_date:
-            top_entry["maxDate"] = max(int(top_entry.get("maxDate", 0)), date_value)
 
-        subgroup_entry = top_entry["subgroups"].setdefault(
-            subgroup_key,
-            {
-                "key": subgroup_key,
-                "label": subgroup_label,
-                "count": 0,
-                "maxDate": 0,
-            },
+        images_by_group.setdefault(subgroup_key, []).append(manifest_entry)
+        top_entry = _update_group_summary(top_groups, top_key, top_label, has_date, date_value)
+        subgroup_summary = _update_group_summary(
+            top_entry["subgroups"], subgroup_key, subgroup_label, has_date, date_value
         )
-        subgroup_entry["count"] = int(subgroup_entry.get("count", 0)) + 1
-        if has_date:
-            subgroup_entry["maxDate"] = max(int(subgroup_entry.get("maxDate", 0)), date_value)
 
         location_label = _format_location_label(doc.get("location"))
         if location_label:
-            counter = location_counts.setdefault(subgroup_key, Counter())
-            counter[location_label] += 1
+            location_counts.setdefault(subgroup_key, Counter())[location_label] += 1
 
-    for image_list in images_by_group.values():
-        image_list.sort(
+    for manifest in images_by_group.values():
+        manifest.sort(
             key=lambda item: (
                 1 if item.get("hasDate") else 0,
                 item.get("dateValue", 0),
@@ -763,61 +854,10 @@ def _build_hierarchy_db() -> Dict[str, object]:
             reverse=True,
         )
 
-    top_group_list: List[Dict[str, object]] = []
-    for top_entry in top_groups.values():
-        subgroups_raw = top_entry["subgroups"].values()
-        subgroups_list: List[Dict[str, object]] = []
-        for sub in subgroups_raw:
-            location_label = None
-            counter = location_counts.get(sub["key"])
-            if counter:
-                location_label = counter.most_common(1)[0][0]
-            max_date_value = int(sub.get("maxDate", 0))
-            formatted_label = (
-                format_date_value(max_date_value)
-                or format_display_date(str(sub.get("label")))
-                or str(sub.get("label"))
-            )
-            subgroup_payload: Dict[str, object] = {
-                "key": sub["key"],
-                "label": sub["label"],
-                "formattedLabel": formatted_label,
-                "count": sub["count"],
-                "dateValue": max_date_value,
-            }
-            if location_label:
-                subgroup_payload["location"] = location_label
-            subgroups_list.append(subgroup_payload)
-        subgroups_list.sort(
-            key=lambda item: (item["dateValue"], item["key"]), reverse=True
-        )
-        formatted_top_label = (
-            format_display_date(str(top_entry["label"]))
-            or str(top_entry["label"])
-        )
-        top_group_list.append(
-            {
-                "key": top_entry["key"],
-                "label": top_entry["label"],
-                "formattedLabel": formatted_top_label,
-                "count": top_entry["count"],
-                "dateValue": top_entry["maxDate"],
-                "subgroups": subgroups_list,
-            }
-        )
-
-    top_group_list.sort(
-        key=lambda item: (item["dateValue"], item["key"]), reverse=True
-    )
-
     hierarchy = {
-        "top_groups": top_group_list,
+        "top_groups": _finalize_top_groups(top_groups, location_counts),
         "images_by_group": images_by_group,
     }
-
-    _DB_CACHE["signature"] = signature
-    _DB_CACHE["hierarchy"] = hierarchy
-    _DB_CACHE["hierarchy_generated"] = now
     return hierarchy
 
 
@@ -921,6 +961,8 @@ def build_hierarchy(root: Path) -> Dict[str, object]:
             key=lambda item: (item["dateValue"], item["key"]), reverse=True
         )
         formatted_top_label = format_display_date(top_entry["label"]) or top_entry["label"]
+        if not _is_year_label(top_entry["label"]):
+            top_entry["maxDate"] = 0
         top_group_list.append(
             {
                 "key": top_entry["key"],
