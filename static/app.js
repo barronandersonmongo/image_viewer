@@ -542,6 +542,9 @@ function updateDownloadControls() {
       elements.downloadCount.textContent = "";
     }
   }
+  if (elements.downloadControls) {
+    elements.downloadControls.classList.toggle("download-bar-hidden", selectedCount === 0);
+  }
   if (elements.downloadButton) {
     elements.downloadButton.disabled = selectedCount === 0 || state.download.inProgress;
     elements.downloadButton.textContent = state.download.inProgress ? "Preparing…" : "Download";
@@ -1409,14 +1412,19 @@ async function updateRandomViewerRange() {
   }
   state.randomViewer.filter.start = startValue;
   state.randomViewer.filter.end = endValue;
-  try {
-    await refreshRandomViewerPool();
-  } catch (error) {
-    console.error("Failed to refresh random viewer pool", error);
-  }
   if (state.randomViewer.running) {
+    try {
+      await refreshRandomViewerPool();
+    } catch (error) {
+      console.error("Failed to refresh random viewer pool", error);
+      return;
+    }
     preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
+  } else {
+    state.randomViewer.pool = [];
+    state.randomViewer.queue = [];
+    state.randomViewer.nextChoice = null;
   }
 }
 
@@ -1463,14 +1471,19 @@ async function removeRandomViewerSpecificDate(key) {
   filter.specificMap.delete(key);
   filter.specificList = filter.specificList.filter((entry) => entry && entry.key !== key);
   renderRandomViewerChips();
-  try {
-    await refreshRandomViewerPool();
-  } catch (error) {
-    console.error("Failed to refresh random viewer pool", error);
-  }
   if (state.randomViewer.running) {
+    try {
+      await refreshRandomViewerPool();
+    } catch (error) {
+      console.error("Failed to refresh random viewer pool", error);
+      return;
+    }
     preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
+  } else {
+    state.randomViewer.pool = [];
+    state.randomViewer.queue = [];
+    state.randomViewer.nextChoice = null;
   }
 }
 
@@ -1498,10 +1511,19 @@ async function addRandomViewerSpecificDate() {
   filter.specificList.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
   input.value = "";
   renderRandomViewerChips();
-  await refreshRandomViewerPool();
   if (state.randomViewer.running) {
+    try {
+      await refreshRandomViewerPool();
+    } catch (error) {
+      console.error("Failed to refresh random viewer pool", error);
+      return;
+    }
     preloadRandomChoice(state.randomViewer.lastPath);
     scheduleRandomViewerTick();
+  } else {
+    state.randomViewer.pool = [];
+    state.randomViewer.queue = [];
+    state.randomViewer.nextChoice = null;
   }
 }
 
@@ -1846,7 +1868,6 @@ function createSubgroup(topGroup, subgroup) {
     locationElement = document.createElement("span");
     locationElement.className = "subgroup-location";
     locationElement.textContent = subgroup.location;
-    metaRow.appendChild(locationElement);
   }
 
   const selectedCountElement = document.createElement("span");
@@ -1854,11 +1875,6 @@ function createSubgroup(topGroup, subgroup) {
   selectedCountElement.hidden = true;
   metaRow.appendChild(selectedCountElement);
 
-  headingText.appendChild(metaRow);
-  header.appendChild(headingText);
-
-  const actions = document.createElement("div");
-  actions.className = "subgroup-actions";
   const selectButton = document.createElement("button");
   selectButton.type = "button";
   selectButton.className = "group-select-toggle";
@@ -1870,8 +1886,13 @@ function createSubgroup(topGroup, subgroup) {
   } else {
     selectButton.textContent = "Select All";
   }
-  actions.appendChild(selectButton);
-  header.appendChild(actions);
+  metaRow.appendChild(selectButton);
+  if (locationElement) {
+    metaRow.appendChild(locationElement);
+  }
+
+  headingText.appendChild(metaRow);
+  header.appendChild(headingText);
 
   container.appendChild(header);
 
@@ -1922,10 +1943,6 @@ function createSubgroup(topGroup, subgroup) {
   }
 
   updateGroupSelectionStatus(groupState.key);
-
-  if (groupState.total > 0) {
-    ensureGroupLoaded(groupState.key).catch((error) => console.error(error));
-  }
 
   return groupState;
 }

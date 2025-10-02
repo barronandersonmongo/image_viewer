@@ -146,6 +146,7 @@ def _aggregate_documents(
     match: Optional[Dict[str, object]] = None,
     post_match: Optional[Dict[str, object]] = None,
     sort_direction: int = -1,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, object]]:
     collection = MONGO_COLLECTION
     if collection is None:
@@ -255,6 +256,8 @@ def _aggregate_documents(
         pipeline.append({"$match": post_match})
 
     pipeline.append({"$sort": {"dateValue": sort_direction, "relative": 1}})
+    if limit and isinstance(limit, int) and limit > 0:
+        pipeline.append({"$limit": int(limit)})
 
     try:
         db_obj = getattr(MONGO_COLLECTION, "database", None)
@@ -927,6 +930,56 @@ def _build_hierarchy_db(include_images: bool = True) -> Dict[str, object]:
     return result
 
 
+def random_pool_payload(
+    root: Path,
+    start: Optional[int],
+    end: Optional[int],
+    order: str,
+    limit: int,
+) -> Dict[str, object]:
+    normalized = order if order in {"asc", "desc"} else "desc"
+    sort_direction = -1 if normalized == "desc" else 1
+
+    post_match: Dict[str, object] = {}
+    if isinstance(start, int) and start > 0:
+        post_match.setdefault("dateValue", {})["$gte"] = start
+    if isinstance(end, int) and end > 0:
+        post_match.setdefault("dateValue", {})["$lte"] = end
+
+    documents = _aggregate_documents(
+        post_match=post_match or None,
+        sort_direction=sort_direction,
+        limit=max(1, min(limit, 20_000)),
+    )
+
+    images: List[Dict[str, object]] = []
+    for doc in documents:
+        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
+        if not isinstance(relative, str):
+            continue
+        rel_path = PurePosixPath(relative)
+        parts = rel_path.parts
+        if not parts:
+            continue
+        top_key = str(doc.get("topKey") or parts[0])
+        if len(parts) >= 2:
+            subgroup_key = str(doc.get("subgroupKey") or f"{parts[0]}/{parts[1]}")
+        else:
+            subgroup_key = str(doc.get("subgroupKey") or top_key)
+
+        images.append(
+            {
+                "path": relative,
+                "groupKey": subgroup_key,
+                "topKey": top_key,
+                "dateValue": doc.get("dateValue") or 0,
+                "dateHint": doc.get("subgroupLabel") or doc.get("relative"),
+            }
+        )
+
+    return {"images": images, "order": normalized}
+
+
 def build_hierarchy(root: Path) -> Dict[str, object]:
     if using_database():
         return _build_hierarchy_db()
@@ -1323,6 +1376,8 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.api_groups(params)
             elif route == "/api/hierarchy":
                 self.api_hierarchy(params)
+            elif route == "/api/random-pool":
+                self.api_random_pool(params)
             elif route == "/api/group-images":
                 self.api_group_images(params)
             elif route == "/api/timeline":
