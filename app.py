@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ExifTags
 
 try:  # Optional dependency for MongoDB metadata support
     from pymongo import ASCENDING, DESCENDING, MongoClient
@@ -54,6 +54,7 @@ THUMBNAIL_DEFAULT_SIZE = 320
 THUMBNAIL_CACHE_DIR = Path(__file__).with_name(".thumbnail_cache")
 THUMBNAIL_PLACEHOLDER_PATH = STATIC_DIR / "thumbnail-placeholder.svg"
 IMAGE_CACHE_TTL_SECONDS = 30
+EXIF_CACHE_TTL_SECONDS = 300
 
 _IMAGE_CACHE: Dict[str, object] = {
     "root": None,
@@ -62,6 +63,21 @@ _IMAGE_CACHE: Dict[str, object] = {
     "hierarchy_root": None,
     "hierarchy_generated": 0.0,
     "hierarchy": None,
+}
+
+_EXIF_CACHE: Dict[str, Tuple[float, List[Dict[str, str]]]] = {}
+EXIF_TAGS = {tag_id: tag_name for tag_id, tag_name in ExifTags.TAGS.items()}
+GPS_TAGS = {
+    tag_id: tag_name for tag_id, tag_name in getattr(ExifTags, "GPSTAGS", {}).items()
+}
+_EXIF_IGNORED_TAGS = {
+    "MakerNote",
+    "UserComment",
+    "XPKeywords",
+    "XPComment",
+    "XPSubject",
+    "XPTitle",
+    "XPAuthor",
 }
 
 MONGO_COLLECTION: Optional["Collection"] = None
@@ -462,11 +478,14 @@ def directory_payload(root: Path, target: Path) -> Dict[str, object]:
 
 
 def search_directories(root: Path, query: str, limit: int = 50) -> List[Dict[str, str]]:
-    normalized_query = query.strip()
+    normalized_query = _normalize_search_text(query)
     if not normalized_query:
         return []
 
-    normalized_query = normalized_query.lower().replace("-", "_")
+    query_tokens = [token for token in normalized_query.split(" ") if token]
+    if not query_tokens:
+        return []
+
     results: List[Dict[str, str]] = []
     seen_paths: set[str] = set()
 
@@ -475,33 +494,38 @@ def search_directories(root: Path, query: str, limit: int = 50) -> List[Dict[str
         for directory in sorted(dirs, key=str.lower):
             dir_path = Path(current_root) / directory
             relative = str(dir_path.relative_to(root)).replace(os.sep, "/")
-            haystack = relative.lower().replace("-", "_")
-            if normalized_query in haystack:
+            hint = guess_date_hint(dir_path.relative_to(root))
+            has_date, date_value = _extract_date_value(Path(relative))
+            haystack = _build_search_haystack(
+                (relative, directory, hint or ""),
+                date_value if has_date else None,
+            )
+            if haystack and all(token in haystack for token in query_tokens):
                 if relative not in seen_paths:
                     seen_paths.add(relative)
-                    results.append(
-                        {
-                            "name": directory,
-                            "path": relative,
-                        }
-                    )
+                    results.append({"name": directory, "path": relative})
                 if len(results) >= limit:
                     return results
 
     if len(results) < limit:
         for image_path in iter_images_recursive(root):
             relative = str(image_path.relative_to(root)).replace(os.sep, "/")
-            haystack = relative.lower().replace("-", "_")
-            if normalized_query in haystack:
+            hint = guess_date_hint(image_path.relative_to(root))
+            has_date, date_value = _extract_date_value(Path(relative))
+            haystack = _build_search_haystack(
+                (
+                    relative,
+                    image_path.name,
+                    image_path.parent.name,
+                    hint or "",
+                ),
+                date_value if has_date else None,
+            )
+            if haystack and all(token in haystack for token in query_tokens):
                 directory_path = str(image_path.parent.relative_to(root)).replace(os.sep, "/")
                 if directory_path not in seen_paths:
                     seen_paths.add(directory_path)
-                    results.append(
-                        {
-                            "name": image_path.parent.name,
-                            "path": directory_path,
-                        }
-                    )
+                    results.append({"name": image_path.parent.name, "path": directory_path})
                 if len(results) >= limit:
                     break
     return results
@@ -580,6 +604,217 @@ def format_date_value(value: int) -> Optional[str]:
         return datetime(year, month, day).strftime("%B %d, %Y").replace(" 0", " ")
     except ValueError:
         return None
+
+
+_SEARCH_SANITIZE_PATTERN = re.compile(r"[^0-9a-z]+")
+_MONTH_NAMES = (
+    "",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
+
+_MONTH_ABBREVIATIONS = (
+    "",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "may",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "oct",
+    "nov",
+    "dec",
+)
+
+
+def _normalize_search_text(value: object) -> str:
+    text = _SEARCH_SANITIZE_PATTERN.sub(" ", str(value or "").lower())
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _date_tokens_from_value(date_value: int) -> List[str]:
+    if not isinstance(date_value, int) or date_value <= 0:
+        return []
+    year = date_value // 10000
+    month = (date_value % 10000) // 100
+    day = date_value % 100
+    if not (1 <= month <= 12 and 1 <= day <= 31 and year > 0):
+        return []
+    padded_month = f"{month:02d}"
+    padded_day = f"{day:02d}"
+    tokens = [
+        f"{year:04d}{padded_month}{padded_day}",
+        f"{year:04d} {padded_month} {padded_day}",
+        f"{padded_month} {padded_day} {year:04d}",
+        f"{padded_day} {padded_month} {year:04d}",
+    ]
+    month_name = _MONTH_NAMES[month]
+    month_abbr = _MONTH_ABBREVIATIONS[month]
+    if month_name:
+        tokens.append(f"{month_name} {day} {year}")
+        tokens.append(f"{day} {month_name} {year}")
+    if month_abbr:
+        tokens.append(f"{month_abbr} {day} {year}")
+        tokens.append(f"{day} {month_abbr} {year}")
+    return tokens
+
+
+def _build_search_haystack(parts: Iterable[object], date_value: Optional[int] = None) -> str:
+    tokens: List[str] = []
+    for part in parts:
+        normalized_part = _normalize_search_text(part)
+        if normalized_part:
+            tokens.append(normalized_part)
+
+    extras: List[str] = []
+    if isinstance(date_value, int) and date_value > 0:
+        extras = _date_tokens_from_value(date_value)
+
+    if not extras:
+        for part in parts:
+            parsed = _parse_date_label(str(part))
+            if parsed:
+                fallback_value = parsed.year * 10000 + parsed.month * 100 + parsed.day
+                extras = _date_tokens_from_value(fallback_value)
+                if extras:
+                    break
+
+    for extra in extras:
+        normalized_extra = _normalize_search_text(extra)
+        if normalized_extra:
+            tokens.append(normalized_extra)
+
+    if not tokens:
+        return ""
+
+    deduped = list(dict.fromkeys(tokens))
+    return " ".join(deduped)
+
+
+def _clean_exif_string(value: str) -> str:
+    cleaned = value.replace("\x00", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_exif_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                decoded = value.decode(encoding, errors="ignore")
+                if decoded:
+                    return _clean_exif_string(decoded)
+            except Exception:  # noqa: BLE001 - defensive decode guard
+                continue
+        return value.hex()
+    if isinstance(value, (list, tuple, set)):
+        parts = [_normalize_exif_value(part) for part in value]
+        filtered = [part for part in parts if part]
+        return ", ".join(filtered)
+    if isinstance(value, dict):
+        pieces = []
+        for key, sub_value in value.items():
+            normalized = _normalize_exif_value(sub_value)
+            if normalized:
+                pieces.append(f"{key}: {normalized}")
+        return "; ".join(pieces)
+    return _clean_exif_string(str(value))
+
+
+def _read_exif_fields(image_path: Path) -> List[Dict[str, str]]:
+    try:
+        with Image.open(image_path) as img:
+            exif_data = img.getexif()
+    except Exception:  # noqa: BLE001 - return empty on parse errors
+        return []
+
+    if not exif_data:
+        return []
+
+    merged: Dict[str, List[str]] = {}
+    
+    def process_ifd(mapping, tag_lookup: Dict[int, str], prefix: Optional[str] = None) -> None:
+        if not mapping:
+            return
+        for tag_id, raw_value in mapping.items():
+            tag_name = tag_lookup.get(tag_id) or EXIF_TAGS.get(tag_id) or f"Tag {tag_id}"
+            if tag_name in _EXIF_IGNORED_TAGS:
+                continue
+            normalized = _normalize_exif_value(raw_value)
+            if not normalized:
+                continue
+            if len(normalized) > 500:
+                normalized = normalized[:497] + "…"
+            label = f"{prefix}{tag_name}" if prefix else tag_name
+            entries = merged.setdefault(label, [])
+            if normalized not in entries:
+                entries.append(normalized)
+
+    process_ifd(exif_data, EXIF_TAGS)
+
+    if hasattr(exif_data, "get_ifd"):
+        ifd_namespace = getattr(ExifTags, "IFD", None)
+        if ifd_namespace is not None:
+            ifd_candidates = [
+                ("Exif", getattr(ifd_namespace, "Exif", None), EXIF_TAGS, None),
+                ("GPSInfo", getattr(ifd_namespace, "GPSInfo", None), GPS_TAGS or EXIF_TAGS, None),
+                ("Interoperability", getattr(ifd_namespace, "Interoperability", None), EXIF_TAGS, None),
+                ("1st", getattr(ifd_namespace, "IFD1", None) if hasattr(ifd_namespace, "IFD1") else getattr(ifd_namespace, "First", None), EXIF_TAGS, None),
+            ]
+            for name, ifd_id, lookup, prefix in ifd_candidates:
+                if not ifd_id:
+                    continue
+                try:
+                    ifd_mapping = exif_data.get_ifd(ifd_id)
+                except Exception:  # noqa: BLE001 - ignore missing IFDs
+                    continue
+                process_ifd(ifd_mapping, lookup, prefix)
+
+    gps_block = exif_data.get(ExifTags.IFD.GPSInfo) if hasattr(ExifTags, "IFD") else None
+    if gps_block and isinstance(gps_block, dict):
+        process_ifd(gps_block, GPS_TAGS or EXIF_TAGS)
+
+    fields = [
+        {"label": label, "value": "; ".join(values)}
+        for label, values in merged.items()
+    ]
+    fields.sort(key=lambda entry: entry["label"].lower())
+    return fields
+
+
+def get_exif_metadata(root: Path, relative: str) -> List[Dict[str, str]]:
+    normalized_relative = relative.replace("\\", "/").lstrip("/")
+    cache_key = f"{root}:{normalized_relative}"
+    now = time.time()
+    cached = _EXIF_CACHE.get(cache_key)
+    if cached and now - cached[0] < EXIF_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    target = resolve_relative_path(root, normalized_relative)
+    if not target.is_file():
+        raise FileNotFoundError
+
+    fields = _read_exif_fields(target)
+    if len(_EXIF_CACHE) > 1024:
+        _EXIF_CACHE.clear()
+    _EXIF_CACHE[cache_key] = (now, fields)
+    return fields
 
 
 def sanitize_zip_component(component: str, fallback: str = "item") -> str:
@@ -1372,6 +1607,8 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.api_thumbnail(params)
             elif route == "/api/search":
                 self.api_search(params)
+            elif route == "/api/exif":
+                self.api_exif(params)
             elif route == "/api/groups":
                 self.api_groups(params)
             elif route == "/api/hierarchy":
@@ -1571,6 +1808,18 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         query = params.get("query", [""])[0]
         results = search_directories(self.root_path, query, limit=75)
         self.send_json({"results": results})
+
+    def api_exif(self, params: Dict[str, List[str]]) -> None:
+        relative_param = params.get("path", [""])[0]
+        if not relative_param:
+            raise ValueError("Missing image path")
+        resolved_relative = unquote(relative_param)
+        target = resolve_relative_path(self.root_path, resolved_relative)
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError
+        normalized = str(target.relative_to(self.root_path)).replace(os.sep, "/")
+        fields = get_exif_metadata(self.root_path, normalized)
+        self.send_json({"path": normalized, "fields": fields})
 
     def api_groups(self, params: Dict[str, List[str]]) -> None:
         order = params.get("order", ["desc"])[0].lower()

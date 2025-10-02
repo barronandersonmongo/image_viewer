@@ -7,6 +7,38 @@ const urlParams = new URLSearchParams(window.location.search);
 const initialOrder = urlParams.get("order") === "asc" ? "asc" : "desc";
 const initialImageParam = urlParams.get("image");
 
+const MONTH_NAMES = [
+  "",
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+const MONTH_ABBREVIATIONS = [
+  "",
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
 const state = {
   order: initialOrder,
   orderVersion: 0,
@@ -24,11 +56,16 @@ const state = {
   groupIndexMap: new Map(),
   imagesByGroup: new Map(),
   pathToImage: new Map(),
+  exifCache: new Map(),
   viewer: {
     open: false,
     groupKey: null,
     index: -1,
     pendingBlend: 0,
+    detailsOpen: false,
+    detailsPath: null,
+    detailsLoading: false,
+    detailsRequestToken: null,
   },
   initialImagePath: initialImageParam,
   activeThumb: null,
@@ -75,6 +112,12 @@ const elements = {
   viewerPrev: document.getElementById("viewerPrev"),
   viewerNext: document.getElementById("viewerNext"),
   viewerClose: document.getElementById("viewerClose"),
+  viewerDetailsToggle: document.getElementById("viewerDetailsToggle"),
+  viewerDetailsPanel: document.getElementById("viewerDetailsPanel"),
+  viewerDetailsClose: document.getElementById("viewerDetailsClose"),
+  viewerDetailsStatus: document.getElementById("viewerDetailsStatus"),
+  viewerDetailsTable: document.getElementById("viewerDetailsTable"),
+  viewerDetailsTableBody: document.getElementById("viewerDetailsTableBody"),
   header: document.getElementById("appHeader"),
   controlContent: document.getElementById("controlContent"),
   searchForm: document.getElementById("searchForm"),
@@ -123,6 +166,64 @@ function formatPhotoCount(count) {
   const value = Number.isFinite(count) ? Math.max(0, count) : 0;
   const formatted = value.toLocaleString();
   return `${formatted} photo${value === 1 ? "" : "s"}`;
+}
+
+function normalizeSearchText(text) {
+  if (text === null || text === undefined) {
+    return "";
+  }
+  return text
+    .toString()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildSearchHaystack(topGroup, subgroup) {
+  const parts = [];
+  const topLabel = topGroup ? (topGroup.formattedLabel || topGroup.label || "") : "";
+  const subgroupLabel = subgroup ? (subgroup.formattedLabel || subgroup.label || "") : "";
+  const subgroupKey = subgroup ? subgroup.key || "" : "";
+  const subgroupRawLabel = subgroup ? subgroup.label || "" : "";
+  const location = subgroup && typeof subgroup.location === "string" ? subgroup.location : "";
+
+  [topLabel, subgroupLabel, subgroupRawLabel, subgroupKey, location]
+    .filter((value) => value)
+    .forEach((value) => parts.push(value));
+
+  const dateValueRaw = subgroup && subgroup.dateValue !== undefined ? Number(subgroup.dateValue) : NaN;
+  if (Number.isFinite(dateValueRaw) && dateValueRaw > 0) {
+    const year = Math.floor(dateValueRaw / 10000);
+    const month = Math.floor((dateValueRaw % 10000) / 100);
+    const day = dateValueRaw % 100;
+    if (year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const paddedMonth = String(month).padStart(2, "0");
+      const paddedDay = String(day).padStart(2, "0");
+      parts.push(
+        `${year}${paddedMonth}${paddedDay}`,
+        `${year} ${paddedMonth} ${paddedDay}`,
+        `${paddedMonth} ${paddedDay} ${year}`,
+        `${paddedDay} ${paddedMonth} ${year}`,
+      );
+      const monthName = MONTH_NAMES[month] || "";
+      const monthAbbr = MONTH_ABBREVIATIONS[month] || "";
+      if (monthName) {
+        parts.push(
+          `${monthName} ${day} ${year}`,
+          `${day} ${monthName} ${year}`,
+        );
+      }
+      if (monthAbbr) {
+        parts.push(
+          `${monthAbbr} ${day} ${year}`,
+          `${day} ${monthAbbr} ${year}`,
+        );
+      }
+    }
+  }
+
+  return normalizeSearchText(parts.join(" "));
 }
 
 function updateComboboxAria() {
@@ -240,6 +341,7 @@ function buildTopGroupOptions(groups) {
   const options = (Array.isArray(groups) ? groups : []).map((group) => ({
     key: group.key,
     label: group.formattedLabel || group.label,
+    normalizedLabel: normalizeSearchText(group.formattedLabel || group.label || ""),
     count: group.count || 0,
     dateValue: typeof group.dateValue === "number" ? group.dateValue : 0,
   }));
@@ -306,14 +408,18 @@ function closeCombobox() {
 }
 
 function filterComboboxOptions(query) {
-  const normalized = query.trim().toLowerCase();
   if (!state.topGroupOptions.length) {
     state.combobox.filtered = [];
     renderComboboxOptions();
     return;
   }
-  const filtered = normalized
-    ? state.topGroupOptions.filter((option) => option.label.toLowerCase().includes(normalized))
+  const normalized = normalizeSearchText(query);
+  const tokens = normalized ? normalized.split(" ").filter(Boolean) : [];
+  const filtered = tokens.length
+    ? state.topGroupOptions.filter((option) => {
+        const labelText = option.normalizedLabel || normalizeSearchText(option.label || "");
+        return tokens.every((token) => labelText.includes(token));
+      })
     : [...state.topGroupOptions];
   state.combobox.filtered = filtered;
   state.combobox.activeIndex = -1;
@@ -2436,6 +2542,7 @@ function closeViewer() {
   state.viewer.open = false;
   state.viewer.groupKey = null;
   state.viewer.index = -1;
+  state.viewer.detailsPath = null;
   elements.viewerOverlay.hidden = true;
   document.body.classList.remove("viewer-open");
   if (elements.header) {
@@ -2447,6 +2554,7 @@ function closeViewer() {
   if (state.randomViewer.running) {
     stopRandomViewer({ resetToggle: true });
   }
+  setViewerDetailsVisibility(false);
   updateUrlWithImage(null);
   if (state.activeThumb) {
     state.activeThumb.classList.remove("active");
@@ -2480,6 +2588,7 @@ function renderViewer() {
     mainImage.src = `/api/image?path=${encodeURIComponent(item.path)}`;
     mainImage.alt = item.name;
   }
+  updateViewerDetails(item);
   const finalize = () => {
     updateViewerMetadata(groupState, item);
     highlightActiveThumbnail(item);
@@ -2519,6 +2628,7 @@ function renderViewer() {
     setInfoBar(elements.viewerInfoLeft, "", "block");
     setInfoBar(elements.viewerInfoRight, "", "block");
     highlightActiveThumbnail(item);
+    updateViewerDetails(null);
     if (elements.viewerContainer) {
       elements.viewerContainer.classList.remove("portrait");
     }
@@ -2561,6 +2671,157 @@ function setInfoBar(element, text, displayStyle) {
   }
 }
 
+function clearViewerDetailsContent() {
+  if (elements.viewerDetailsTableBody) {
+    elements.viewerDetailsTableBody.innerHTML = "";
+  }
+  if (elements.viewerDetailsTable) {
+    elements.viewerDetailsTable.hidden = true;
+  }
+  if (elements.viewerDetailsStatus) {
+    elements.viewerDetailsStatus.textContent = "";
+    elements.viewerDetailsStatus.hidden = true;
+    elements.viewerDetailsStatus.classList.remove("error");
+  }
+}
+
+function showViewerDetailsMessage(message, variant = "info") {
+  if (!elements.viewerDetailsStatus) {
+    return;
+  }
+  if (elements.viewerDetailsTable) {
+    elements.viewerDetailsTable.hidden = true;
+  }
+  elements.viewerDetailsStatus.textContent = message || "";
+  elements.viewerDetailsStatus.hidden = !message;
+  elements.viewerDetailsStatus.classList.toggle("error", variant === "error");
+}
+
+function renderViewerDetailsTable(fields) {
+  clearViewerDetailsContent();
+  const rows = Array.isArray(fields) ? fields : [];
+  if (!rows.length) {
+    showViewerDetailsMessage("No EXIF data found for this image.");
+    return;
+  }
+  if (!elements.viewerDetailsTable || !elements.viewerDetailsTableBody) {
+    return;
+  }
+  rows.forEach((entry) => {
+    const label = entry && entry.label ? String(entry.label) : "";
+    const value = entry && entry.value ? String(entry.value) : "";
+    if (!label || !value) {
+      return;
+    }
+    const row = document.createElement("tr");
+    const keyCell = document.createElement("th");
+    keyCell.scope = "row";
+    keyCell.textContent = label;
+    const valueCell = document.createElement("td");
+    valueCell.textContent = value;
+    row.appendChild(keyCell);
+    row.appendChild(valueCell);
+    elements.viewerDetailsTableBody.appendChild(row);
+  });
+  if (!elements.viewerDetailsTableBody.childElementCount) {
+    showViewerDetailsMessage("No EXIF data found for this image.");
+    return;
+  }
+  elements.viewerDetailsTable.hidden = false;
+}
+
+function showViewerDetailsLoading() {
+  clearViewerDetailsContent();
+  showViewerDetailsMessage("Loading details…");
+}
+
+function showViewerDetailsError(message) {
+  clearViewerDetailsContent();
+  showViewerDetailsMessage(message || "Unable to load details.", "error");
+}
+
+async function loadViewerDetails(path) {
+  if (!state.viewer.detailsOpen || !path) {
+    return;
+  }
+  const cached = state.exifCache.get(path);
+  if (cached) {
+    renderViewerDetailsTable(cached);
+    return;
+  }
+  showViewerDetailsLoading();
+  const requestToken = Symbol("exifRequest");
+  state.viewer.detailsLoading = true;
+  state.viewer.detailsRequestToken = requestToken;
+  try {
+    const response = await fetchJson(`/api/exif?path=${encodeURIComponent(path)}`);
+    const rawFields = Array.isArray(response.fields) ? response.fields : [];
+    const normalized = rawFields
+      .map((entry) => ({
+        label: entry && entry.label ? String(entry.label).trim() : "",
+        value: entry && entry.value ? String(entry.value).trim() : "",
+      }))
+      .filter((entry) => entry.label && entry.value);
+    state.exifCache.set(path, normalized);
+    if (state.viewer.detailsRequestToken !== requestToken || state.viewer.detailsPath !== path) {
+      return;
+    }
+    renderViewerDetailsTable(normalized);
+  } catch (error) {
+    if (state.viewer.detailsRequestToken !== requestToken || state.viewer.detailsPath !== path) {
+      return;
+    }
+    const message = error && error.message ? String(error.message) : "Unable to load details.";
+    showViewerDetailsError(message);
+  } finally {
+    if (state.viewer.detailsRequestToken === requestToken) {
+      state.viewer.detailsLoading = false;
+      state.viewer.detailsRequestToken = null;
+    }
+  }
+}
+
+function updateViewerDetails(item) {
+  const path = item && item.path ? item.path : null;
+  state.viewer.detailsPath = path;
+  if (!state.viewer.detailsOpen) {
+    return;
+  }
+  if (!path) {
+    clearViewerDetailsContent();
+    showViewerDetailsMessage("No image selected.");
+    return;
+  }
+  const cached = state.exifCache.get(path);
+  if (cached) {
+    renderViewerDetailsTable(cached);
+    return;
+  }
+  loadViewerDetails(path);
+}
+
+function setViewerDetailsVisibility(open) {
+  state.viewer.detailsOpen = Boolean(open);
+  if (elements.viewerDetailsToggle) {
+    elements.viewerDetailsToggle.setAttribute("aria-expanded", state.viewer.detailsOpen ? "true" : "false");
+    elements.viewerDetailsToggle.textContent = state.viewer.detailsOpen ? "Hide details" : "Show details";
+  }
+  if (elements.viewerDetailsPanel) {
+    elements.viewerDetailsPanel.hidden = !state.viewer.detailsOpen;
+  }
+  if (!state.viewer.detailsOpen) {
+    state.viewer.detailsLoading = false;
+    state.viewer.detailsRequestToken = null;
+    clearViewerDetailsContent();
+    return;
+  }
+  updateViewerDetails({ path: state.viewer.detailsPath });
+}
+
+function toggleViewerDetails() {
+  setViewerDetailsVisibility(!state.viewer.detailsOpen);
+}
+
 function showViewerLoading(blendDuration = 0) {
   if (elements.viewerContainer) {
     elements.viewerContainer.classList.remove("portrait");
@@ -2582,6 +2843,9 @@ function showViewerLoading(blendDuration = 0) {
   setInfoBar(elements.viewerInfoBottom, "", "block");
   setInfoBar(elements.viewerInfoLeft, "", "block");
   setInfoBar(elements.viewerInfoRight, "", "block");
+  if (state.viewer.detailsOpen) {
+    showViewerDetailsLoading();
+  }
 }
 
 function updateViewerMetadata(groupState, item) {
@@ -2781,22 +3045,28 @@ function handleSearch(event) {
   event.preventDefault();
   openControlPanel();
   closeCombobox();
-  const query = elements.searchInput.value.trim().toLowerCase();
-  if (!query) {
-      closeControlPanel();
+  const rawQuery = elements.searchInput.value || "";
+  const normalizedQuery = normalizeSearchText(rawQuery);
+  const tokens = normalizedQuery ? normalizedQuery.split(" ").filter(Boolean) : [];
+  if (!tokens.length) {
+    closeControlPanel();
     return;
   }
   const matches = [];
   state.topGroups.forEach((topGroup) => {
-    const topLabel = topGroup.formattedLabel || topGroup.label;
     const subgroups = Array.isArray(topGroup.subgroups) ? topGroup.subgroups : [];
     subgroups.forEach((subgroup) => {
-      const subgroupLabel = subgroup.formattedLabel || subgroup.label;
-      const location = typeof subgroup.location === "string" ? subgroup.location : "";
-      const haystack = `${topLabel} ${subgroupLabel} ${location}`.toLowerCase();
-      if (!haystack.includes(query)) {
+      const haystack = buildSearchHaystack(topGroup, subgroup);
+      if (!haystack) {
         return;
       }
+      const matchesQuery = tokens.every((token) => haystack.includes(token));
+      if (!matchesQuery) {
+        return;
+      }
+      const topLabel = topGroup.formattedLabel || topGroup.label;
+      const subgroupLabel = subgroup.formattedLabel || subgroup.label;
+      const location = typeof subgroup.location === "string" ? subgroup.location : "";
       const manifest = state.imagesByGroup.get(subgroup.key) || [];
       const count = manifest.length || subgroup.count || 0;
       matches.push({
@@ -2991,6 +3261,20 @@ if (elements.orderSwitch) {
     }
     elements.orderToggle.checked = nextOrder === "asc";
     applyOrder(nextOrder, { updateUrl: true });
+  });
+}
+
+if (elements.viewerDetailsToggle) {
+  elements.viewerDetailsToggle.addEventListener("click", (event) => {
+    event.preventDefault();
+    toggleViewerDetails();
+  });
+}
+
+if (elements.viewerDetailsClose) {
+  elements.viewerDetailsClose.addEventListener("click", (event) => {
+    event.preventDefault();
+    setViewerDetailsVisibility(false);
   });
 }
 

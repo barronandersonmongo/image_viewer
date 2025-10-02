@@ -117,6 +117,21 @@
         </div>
         <button class="viewer-nav next" id="viewerNext" type="button" aria-label="Next image">›</button>
       </div>
+      <button class="viewer-details-toggle" id="viewerDetailsToggle" type="button" aria-expanded="false">Show details</button>
+      <section class="viewer-details-panel" id="viewerDetailsPanel" aria-labelledby="viewerDetailsTitle" hidden>
+        <header class="viewer-details-header">
+          <h2 id="viewerDetailsTitle">Photo Details</h2>
+          <button type="button" class="viewer-details-close" id="viewerDetailsClose" aria-label="Hide details">×</button>
+        </header>
+        <div class="viewer-details-content" role="region" aria-live="polite">
+          <p class="viewer-details-status" id="viewerDetailsStatus" hidden></p>
+          <div class="viewer-details-scroll">
+            <table class="viewer-details-table" id="viewerDetailsTable" hidden aria-describedby="viewerDetailsTitle">
+              <tbody id="viewerDetailsTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
       <div class="viewer-info-bar viewer-info-right" id="viewerInfoRight"></div>
       <div class="viewer-info-bar viewer-info-bottom" id="viewerInfoBottom"></div>
     </div>
