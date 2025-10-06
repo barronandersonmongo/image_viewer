@@ -1373,7 +1373,7 @@ body.viewer-open {
   position: absolute;
   top: calc(88px + env(safe-area-inset-top));
   right: calc(24px + env(safe-area-inset-right));
-  width: min(420px, 92vw);
+  width: min(620px, 94vw);
   max-height: calc(100vh - 180px);
   background: rgba(15, 23, 42, 0.92);
   border: 1px solid rgba(148, 163, 184, 0.28);
@@ -1385,6 +1385,11 @@ body.viewer-open {
   gap: 12px;
   z-index: 120;
   pointer-events: auto;
+}
+
+.viewer-details-panel,
+.viewer-details-panel * {
+  user-select: text;
 }
 
 .viewer-details-header {
@@ -1442,7 +1447,7 @@ body.viewer-open {
 
 .viewer-details-scroll {
   max-height: 45vh;
-  overflow-y: auto;
+  overflow: auto;
   border-radius: 12px;
   border: 1px solid rgba(148, 163, 184, 0.24);
   background: rgba(15, 23, 42, 0.55);
@@ -1476,7 +1481,9 @@ body.viewer-open {
 .viewer-details-table td {
   width: 60%;
   color: rgba(226, 232, 240, 0.82);
-  word-break: break-word;
+  white-space: nowrap;
+  word-break: normal;
+  overflow: visible;
 }
 
 .viewer-details-table tbody tr:last-child th,
@@ -1486,7 +1493,7 @@ body.viewer-open {
 
 @media (max-width: 720px) {
   .viewer-details-panel {
-    width: min(440px, 96vw);
+    width: min(520px, 96vw);
     left: 50%;
     right: auto;
     transform: translate3d(-50%, 0, 0);
