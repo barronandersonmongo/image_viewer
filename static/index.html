@@ -13,78 +13,91 @@
     <header class="app-header collapsed" id="appHeader">
       <div class="header-bar">
         <h1>Barry Image Viewer</h1>
-        <button type="button" class="flyout-pin" id="flyoutPin" aria-pressed="false" aria-label="Pin controls">
-          <span class="pin-icon" aria-hidden="true">📌</span>
-          <span class="pin-text">Pin</span>
-        </button>
+        <div class="header-controls">
+          <div class="order-switch" id="orderSwitch">
+            <span class="order-text order-text-left">Newest first</span>
+            <label class="order-toggle">
+              <input type="checkbox" id="orderToggle" aria-label="Toggle sort order">
+              <span class="order-slider"><span class="order-handle"></span></span>
+            </label>
+            <span class="order-text order-text-right">Oldest first</span>
+          </div>
+          <button type="button" class="flyout-pin" id="flyoutPin" aria-pressed="false" aria-label="Pin controls">
+            <span class="pin-icon" aria-hidden="true">📌</span>
+            <span class="pin-text">Pin</span>
+          </button>
+        </div>
       </div>
       <div class="control-content" id="controlContent" aria-hidden="true">
-        <div class="order-switch" id="orderSwitch">
-          <span class="order-text order-text-left">Newest first</span>
-          <label class="order-toggle">
-            <input type="checkbox" id="orderToggle" aria-label="Toggle sort order">
-            <span class="order-slider"><span class="order-handle"></span></span>
-          </label>
-          <span class="order-text order-text-right">Oldest first</span>
+        <div class="control-tabs" role="tablist">
+          <button type="button" class="control-tab active" data-tab="search" id="tabButtonSearch" role="tab" aria-selected="true" aria-controls="controlPanelSearch">Search</button>
+          <button type="button" class="control-tab" data-tab="year" id="tabButtonYear" role="tab" aria-selected="false" aria-controls="controlPanelYear">Jump to Year</button>
+          <button type="button" class="control-tab" data-tab="random" id="tabButtonRandom" role="tab" aria-selected="false" aria-controls="controlPanelRandom">Random Viewer</button>
         </div>
-        <form id="searchForm" class="search-form">
-          <div class="search-combobox" id="searchCombobox" role="combobox" aria-expanded="false" aria-owns="searchSuggestions" aria-haspopup="listbox">
-            <input type="search" id="searchInput" placeholder="Search by date or choose a year" aria-label="Search by date" aria-autocomplete="list" aria-controls="searchSuggestions">
-            <ul class="search-suggestions" id="searchSuggestions" role="listbox" hidden></ul>
-          </div>
-          <button type="submit">Search</button>
-        </form>
-        <div class="search-results" id="searchResults"></div>
-        <nav class="year-navigation" id="yearNavigation" aria-label="Jump to year" hidden>
-          <p class="year-navigation-title" id="yearNavigationTitle">Jump to year</p>
-          <div class="year-navigation-buttons" id="yearNavigationButtons" role="group" aria-labelledby="yearNavigationTitle"></div>
-          <label class="year-navigation-select" for="yearNavigationSelect">
-            <span>Jump to year</span>
-            <select id="yearNavigationSelect"></select>
-          </label>
-        </nav>
-        <section class="random-viewer" id="randomViewerSection">
-          <header class="random-viewer-header">
-            <div class="random-viewer-toggle" id="randomViewerToggleWrapper">
-              <label class="toggle-switch">
-                <input type="checkbox" id="randomViewerToggle" aria-labelledby="randomViewerToggleLabel" aria-describedby="randomViewerHelp">
-                <span class="toggle-slider"><span class="toggle-handle"></span></span>
-              </label>
-              <label class="random-viewer-label" id="randomViewerToggleLabel" for="randomViewerToggle">Random image viewer</label>
+        <section class="control-panel" id="controlPanelSearch" role="tabpanel" aria-labelledby="tabButtonSearch">
+          <form id="searchForm" class="search-form">
+            <div class="search-combobox" id="searchCombobox" role="combobox" aria-expanded="false" aria-owns="searchSuggestions" aria-haspopup="listbox">
+              <input type="search" id="searchInput" placeholder="Search by date or choose a year" aria-label="Search by date" aria-autocomplete="list" aria-controls="searchSuggestions">
+              <ul class="search-suggestions" id="searchSuggestions" role="listbox" hidden></ul>
             </div>
-            <p class="random-viewer-help" id="randomViewerHelp">Cycle through photos automatically like a digital frame.</p>
-          </header>
-          <div class="random-viewer-settings" id="randomViewerSettings">
-            <div class="random-setting">
-              <label for="randomViewerDuration">Display time (seconds)</label>
-              <input type="number" id="randomViewerDuration" min="3" max="300" step="1" value="10">
+            <button type="submit">Search</button>
+          </form>
+          <div class="search-results" id="searchResults"></div>
+        </section>
+        <section class="control-panel" id="controlPanelYear" role="tabpanel" aria-labelledby="tabButtonYear" hidden>
+          <nav class="year-navigation" id="yearNavigation" aria-label="Jump to year" hidden>
+            <p class="year-navigation-title" id="yearNavigationTitle">Jump to year</p>
+            <div class="year-navigation-buttons" id="yearNavigationButtons" role="group" aria-labelledby="yearNavigationTitle"></div>
+            <label class="year-navigation-select" for="yearNavigationSelect">
+              <span>Jump to year</span>
+              <select id="yearNavigationSelect"></select>
+            </label>
+          </nav>
+        </section>
+        <section class="control-panel" id="controlPanelRandom" role="tabpanel" aria-labelledby="tabButtonRandom" hidden>
+          <section class="random-viewer" id="randomViewerSection">
+            <header class="random-viewer-header">
+              <div class="random-viewer-toggle" id="randomViewerToggleWrapper">
+                <label class="toggle-switch">
+                  <input type="checkbox" id="randomViewerToggle" aria-labelledby="randomViewerToggleLabel" aria-describedby="randomViewerHelp">
+                  <span class="toggle-slider"><span class="toggle-handle"></span></span>
+                </label>
+                <label class="random-viewer-label" id="randomViewerToggleLabel" for="randomViewerToggle">Random image viewer</label>
+              </div>
+              <p class="random-viewer-help" id="randomViewerHelp">Cycle through photos automatically like a digital frame.</p>
+            </header>
+            <div class="random-viewer-settings" id="randomViewerSettings">
+              <div class="random-setting">
+                <label for="randomViewerDuration">Display time (seconds)</label>
+                <input type="number" id="randomViewerDuration" min="3" max="300" step="1" value="10">
+              </div>
+              <div class="random-setting">
+                <label for="randomViewerBlend">Fade duration (seconds)</label>
+                <input type="number" id="randomViewerBlend" min="0" max="10" step="0.1" value="1">
+              </div>
+              <div class="random-setting random-dates">
+                <fieldset>
+                  <legend>Date range</legend>
+                  <div class="date-range-inputs">
+                    <label for="randomViewerStart">From</label>
+                    <input type="date" id="randomViewerStart">
+                    <label for="randomViewerEnd">To</label>
+                    <input type="date" id="randomViewerEnd">
+                  </div>
+                </fieldset>
+              </div>
+              <div class="random-setting random-specific-dates">
+                <fieldset>
+                  <legend>Specific values</legend>
+                  <div class="specific-date-input">
+                    <input type="text" id="randomViewerSpecificInput" placeholder="e.g. 2023-12-24, 2025, Holidays">
+                    <button type="button" id="randomViewerAddDate">Add group</button>
+                  </div>
+                  <div class="specific-date-chips" id="randomViewerDateChips" aria-live="polite"></div>
+                </fieldset>
+              </div>
             </div>
-            <div class="random-setting">
-              <label for="randomViewerBlend">Fade duration (seconds)</label>
-              <input type="number" id="randomViewerBlend" min="0" max="10" step="0.1" value="1">
-            </div>
-            <div class="random-setting random-dates">
-              <fieldset>
-                <legend>Date range</legend>
-                <div class="date-range-inputs">
-                  <label for="randomViewerStart">From</label>
-                  <input type="date" id="randomViewerStart">
-                  <label for="randomViewerEnd">To</label>
-                  <input type="date" id="randomViewerEnd">
-                </div>
-              </fieldset>
-            </div>
-            <div class="random-setting random-specific-dates">
-              <fieldset>
-                <legend>Specific values</legend>
-                <div class="specific-date-input">
-                  <input type="text" id="randomViewerSpecificInput" placeholder="e.g. 2023-12-24, 2025, Holidays">
-                  <button type="button" id="randomViewerAddDate">Add group</button>
-                </div>
-                <div class="specific-date-chips" id="randomViewerDateChips" aria-live="polite"></div>
-              </fieldset>
-            </div>
-          </div>
+          </section>
         </section>
       </div>
     </header>
@@ -117,11 +130,9 @@
         </div>
         <button class="viewer-nav next" id="viewerNext" type="button" aria-label="Next image">›</button>
       </div>
-      <button class="viewer-details-toggle" id="viewerDetailsToggle" type="button" aria-expanded="false">Show details</button>
       <section class="viewer-details-panel" id="viewerDetailsPanel" aria-labelledby="viewerDetailsTitle" hidden>
         <header class="viewer-details-header">
           <h2 id="viewerDetailsTitle">Photo Details</h2>
-          <button type="button" class="viewer-details-close" id="viewerDetailsClose" aria-label="Hide details">×</button>
         </header>
         <div class="viewer-details-content" role="region" aria-live="polite">
           <p class="viewer-details-status" id="viewerDetailsStatus" hidden></p>

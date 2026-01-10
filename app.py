@@ -4,1600 +4,99 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import io
 import json
 import mimetypes
-import os
-import re
-import time
 import zipfile
-from collections import Counter
-from datetime import datetime
 from http import HTTPStatus
 import http.server
-from pathlib import Path, PurePosixPath
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
-from PIL import Image, ImageOps, ExifTags
-
 try:  # Optional dependency for MongoDB metadata support
-    from pymongo import ASCENDING, DESCENDING, MongoClient
+    from pymongo import MongoClient
     from pymongo.collection import Collection
-except ImportError:  # pragma: no cover - pymongo may be absent in some environments
-    MongoClient = None
-    Collection = None
-    ASCENDING = 1
-    DESCENDING = -1
+except ImportError:  # pragma: no cover - pymongo may be absent
+    MongoClient = None  # type: ignore[assignment]
+    Collection = None  # type: ignore[assignment]
 
-SUPPORTED_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".gif",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".webp",
-}
-
-IGNORED_DIRECTORIES = {".Trash-1000"}
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 8765
-DEFAULT_ROOT = Path("/home/barry/bobby/pictures")
-DEFAULT_MONGO_URI = "mongodb://192.168.1.8"
-DEFAULT_MONGO_DB = "barrydb"
-DEFAULT_MONGO_COLLECTION = "images"
-STATIC_DIR = Path(__file__).with_name("static")
-THUMBNAIL_DEFAULT_SIZE = 320
-THUMBNAIL_CACHE_DIR = Path(__file__).with_name(".thumbnail_cache")
-THUMBNAIL_PLACEHOLDER_PATH = STATIC_DIR / "thumbnail-placeholder.svg"
-IMAGE_CACHE_TTL_SECONDS = 30
-EXIF_CACHE_TTL_SECONDS = 300
-
-_IMAGE_CACHE: Dict[str, object] = {
-    "root": None,
-    "generated": 0.0,
-    "paths": [],
-    "hierarchy_root": None,
-    "hierarchy_generated": 0.0,
-    "hierarchy": None,
-}
-
-_EXIF_CACHE: Dict[str, Tuple[float, List[Dict[str, str]]]] = {}
-EXIF_TAGS = {tag_id: tag_name for tag_id, tag_name in ExifTags.TAGS.items()}
-GPS_TAGS = {
-    tag_id: tag_name for tag_id, tag_name in getattr(ExifTags, "GPSTAGS", {}).items()
-}
-_EXIF_IGNORED_TAGS = {
-    "MakerNote",
-    "UserComment",
-    "XPKeywords",
-    "XPComment",
-    "XPSubject",
-    "XPTitle",
-    "XPAuthor",
-}
-
-MONGO_COLLECTION: Optional["Collection"] = None
-
-
-def set_database_collection(collection: Optional["Collection"]) -> None:
-    global MONGO_COLLECTION
-    MONGO_COLLECTION = collection
+from viewer.config import (
+    AppConfig,
+    MongoConfig,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DEFAULT_ROOT,
+    DEFAULT_MONGO_COLLECTION,
+    DEFAULT_MONGO_DB,
+    DEFAULT_MONGO_HOLIDAY_COLLECTION,
+    DEFAULT_MONGO_URI,
+    STATIC_DIR,
+    THUMBNAIL_DEFAULT_SIZE,
+    THUMBNAIL_PLACEHOLDER_PATH,
+)
+from viewer.data_access import HolidayRepository, ImageRepository
+from viewer.exif import get_exif_metadata
+from viewer.filesystem import directory_payload
+from viewer.hierarchy import HierarchyService
+from viewer.search import find_images_by_date_values, find_images_by_filters, search_directories
+from viewer.thumbnails import generate_thumbnail
+from viewer.utils import (
+    SUPPORTED_EXTENSIONS,
+    date_value_from_datetime,
+    resolve_relative_path,
+    sanitize_zip_component,
+)
 
 
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("image/svg+xml", ".svg")
 
 
-def is_ignored_name(name: str) -> bool:
-    return name in IGNORED_DIRECTORIES or name.startswith(".")
-
-
-def resolve_relative_path(root: Path, relative: str) -> Path:
-    relative_path = Path(relative)
-    if relative_path.is_absolute():
-        raise ValueError("Absolute paths are not permitted")
-    full_path = (root / relative_path).resolve()
-    if root == full_path:
-        return full_path
-    if root not in full_path.parents:
-        raise ValueError("Requested path escapes the image root")
-    return full_path
-
-
-def iter_directories(path: Path) -> Iterator[Path]:
-    for entry in sorted(path.iterdir(), key=lambda p: p.name.lower()):
-        if entry.is_dir() and not is_ignored_name(entry.name):
-            yield entry
-
-
-def iter_images(path: Path) -> Iterator[Path]:
-    lowered_exts = {ext.lower() for ext in SUPPORTED_EXTENSIONS}
-    for entry in sorted(path.iterdir(), key=lambda p: p.name.lower()):
-        if entry.is_file() and entry.suffix.lower() in lowered_exts:
-            yield entry
-
-
-def iter_images_recursive(path: Path, limit: Optional[int] = None) -> Iterator[Path]:
-    lowered_exts = {ext.lower() for ext in SUPPORTED_EXTENSIONS}
-    count = 0
-    for current_root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if not is_ignored_name(d)]
-        dirs.sort(key=str.lower)
-        for name in sorted(files, key=str.lower):
-            if Path(name).suffix.lower() in lowered_exts:
-                yield Path(current_root) / name
-                count += 1
-                if limit is not None and count >= limit:
-                    return
-
-
-def guess_date_hint(relative_path: Path) -> Optional[str]:
-    for part in relative_path.parts[::-1]:
-        normalized = part.replace("-", "_")
-        if len(normalized) == 4 and normalized.isdigit():
-            return normalized
-        if len(normalized) >= 8 and normalized[:4].isdigit():
-            cleaned = normalized.replace("_", "-")
-            if cleaned.count("-") >= 2:
-                return cleaned
-    return None
-
-
-def using_database() -> bool:
-    return MONGO_COLLECTION is not None
-
-
-def _relative_path_from_id(value: object) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    normalized = value.replace("\\", "/").lstrip("/").strip()
-    return normalized or None
-
-
-def _aggregate_documents(
-    match: Optional[Dict[str, object]] = None,
-    post_match: Optional[Dict[str, object]] = None,
-    sort_direction: int = -1,
-    limit: Optional[int] = None,
-) -> List[Dict[str, object]]:
-    collection = MONGO_COLLECTION
-    if collection is None:
-        return []
-
-    pipeline: List[Dict[str, object]] = []
-    if match:
-        pipeline.append({"$match": match})
-
-    pipeline.extend(
-        [
-            {
-                "$project": {
-                    "_id": 1,
-                    "image_datetime": 1,
-                    "date_specific": 1,
-                    "location": 1,
-                    "relative_raw": {"$trim": {"input": "$_id", "chars": "/"}},
-                }
-            },
-            {
-                "$addFields": {
-                    "parts_all": {
-                        "$filter": {
-                            "input": {"$split": ["$relative_raw", "/"]},
-                            "cond": {"$ne": ["$$this", ""]},
-                        }
-                    }
-                }
-            },
-            {
-                "$addFields": {
-                    "topKey": {"$arrayElemAt": ["$parts_all", 0]},
-                    "subgroupKey": {
-                        "$cond": [
-                            {"$gte": [{"$size": "$parts_all"}, 2]},
-                            {
-                                "$concat": [
-                                    {"$arrayElemAt": ["$parts_all", 0]},
-                                    "/",
-                                    {"$arrayElemAt": ["$parts_all", 1]},
-                                ]
-                            },
-                            {"$arrayElemAt": ["$parts_all", 0]},
-                        ]
-                    },
-                    "subgroupLabel": {
-                        "$cond": [
-                            {"$gte": [{"$size": "$parts_all"}, 2]},
-                            {"$arrayElemAt": ["$parts_all", 1]},
-                            {"$arrayElemAt": ["$parts_all", 0]},
-                        ]
-                    },
-                }
-            },
-            {"$addFields": {"relative": "$relative_raw"}},
-            {
-                "$addFields": {
-                    "dateValue": {
-                        "$let": {
-                            "vars": {
-                                "dt": {
-                                    "$convert": {
-                                        "input": "$image_datetime",
-                                        "to": "date",
-                                        "onError": None,
-                                        "onNull": None,
-                                    }
-                                }
-                            },
-                            "in": {
-                                "$cond": [
-                                    {"$ifNull": ["$$dt", False]},
-                                    {
-                                        "$toInt": {
-                                            "$dateToString": {
-                                                "format": "%Y%m%d",
-                                                "date": "$$dt",
-                                                "timezone": "UTC",
-                                            }
-                                        }
-                                    },
-                                    0,
-                                ]
-                            },
-                        }
-                    }
-                }
-            },
-            {
-                "$project": {
-                    "_id": 1,
-                    "relative": 1,
-                    "topKey": 1,
-                    "subgroupKey": 1,
-                    "subgroupLabel": 1,
-                    "image_datetime": 1,
-                    "date_specific": 1,
-                    "location": 1,
-                    "dateValue": 1,
-                }
-            },
-        ]
-    )
-
-    if post_match:
-        pipeline.append({"$match": post_match})
-
-    pipeline.append({"$sort": {"dateValue": sort_direction, "relative": 1}})
-    if limit and isinstance(limit, int) and limit > 0:
-        pipeline.append({"$limit": int(limit)})
-
-    try:
-        db_obj = getattr(MONGO_COLLECTION, "database", None)
-        db_name = getattr(db_obj, "name", None) or "<db>"
-        coll_name = getattr(MONGO_COLLECTION, "name", None) or "<collection>"
-        pipeline_str = json.dumps(pipeline, indent=2)
-        print(
-            "[DB] mongo shell copy/paste:\n"
-            f"use {db_name};\n"
-            f"db.{coll_name}.aggregate({pipeline_str});"
-        )
-        return list(MONGO_COLLECTION.aggregate(pipeline, allowDiskUse=True))
-    except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] Mongo aggregation failed: {exc}")
-        return []
-
-def _date_value_from_iso(value: object) -> Optional[int]:
-    if isinstance(value, datetime):
-        dt_obj = value
-    elif isinstance(value, str):
-        try:
-            dt_obj = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    else:
-        return None
-    return dt_obj.year * 10000 + dt_obj.month * 100 + dt_obj.day
-
-
-def _format_location_label(location: object) -> Optional[str]:
-    if not isinstance(location, dict):
-        return None
-
-    address = location.get("address")
-    if not isinstance(address, dict):
-        address = {}
-
-    components: List[str] = []
-    primary_keys = ("city", "town", "village", "hamlet", "suburb", "municipality")
-    for key in primary_keys:
-        value = address.get(key)
-        if value:
-            components.append(str(value))
-            break
-
-    if not components:
-        for key in ("neighbourhood", "county", "state_district"):
-            value = address.get(key)
-            if value:
-                components.append(str(value))
-                break
-
-    road = address.get("road")
-    if road and not components:
-        components.append(str(road))
-
-    state = address.get("state") or address.get("region") or address.get("province")
-    if state:
-        components.append(str(state))
-
-    country = address.get("country")
-    if country:
-        components.append(str(country))
-
-    poi = location.get("poi")
-    if isinstance(poi, dict):
-        name = poi.get("name")
-        if name:
-            components.insert(0, str(name))
-
-    deduped: List[str] = []
-    seen = set()
-    for part in components:
-        normalized = part.strip()
-        if not normalized:
-            continue
-        key = normalized.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(normalized)
-
-    if deduped:
-        return ", ".join(deduped)
-
-    raw = location.get("raw")
-    if isinstance(raw, dict):
-        display = raw.get("display_name")
-        if display:
-            return str(display)
-
-    return None
-
-
-def _fetch_database_documents() -> List[Dict[str, object]]:
-    documents = _aggregate_documents()
-    for doc in documents:
-        relative = doc.get("relative")
-        if not isinstance(relative, str):
-            doc["relative"] = _relative_path_from_id(doc.get("_id"))
-    return documents
-
-def build_breadcrumbs(root: Path, target: Path) -> List[Dict[str, str]]:
-    breadcrumbs = [{"name": "Home", "path": ""}]
-    if target == root:
-        return breadcrumbs
-    relative = target.relative_to(root)
-    accumulated = Path()
-    for segment in relative.parts:
-        accumulated = accumulated / segment
-        breadcrumbs.append({
-            "name": segment,
-            "path": str(accumulated).replace(os.sep, "/"),
-        })
-    return breadcrumbs
-
-
-def first_image_in_tree(path: Path) -> Optional[Path]:
-    for image_path in iter_images_recursive(path, limit=1):
-        return image_path
-    return None
-
-
-def next_folder_first_image(root: Path, target: Path) -> Optional[Path]:
-    if target == root:
-        for candidate in iter_directories(root):
-            found = first_image_in_tree(candidate)
-            if found:
-                return found
-        return None
-
-    parent = target.parent
-    siblings = [d for d in iter_directories(parent)]
-    try:
-        current_index = siblings.index(target)
-    except ValueError:
-        current_index = -1
-
-    for candidate in siblings[current_index + 1 :]:
-        found = first_image_in_tree(candidate)
-        if found:
-            return found
-
-    if parent == root:
-        parent_siblings = [d for d in iter_directories(root)]
-        try:
-            parent_index = parent_siblings.index(parent)
-        except ValueError:
-            parent_index = -1
-        for candidate in parent_siblings[parent_index + 1 :]:
-            found = first_image_in_tree(candidate)
-            if found:
-                return found
-        return None
-
-    return next_folder_first_image(root, parent)
-
-
-def directory_payload(root: Path, target: Path) -> Dict[str, object]:
-    relative = (
-        ""
-        if target == root
-        else str(target.relative_to(root)).replace(os.sep, "/")
-    )
-    directories = []
-    for directory in iter_directories(target):
-        rel_path = str(directory.relative_to(root)).replace(os.sep, "/")
-        has_images = any(iter_images_recursive(directory, limit=1))
-        directories.append(
-            {
-                "name": directory.name,
-                "path": rel_path,
-                "hasImages": has_images,
-            }
-        )
-
-    images = []
-    for image_path in iter_images(target):
-        rel_path = str(image_path.relative_to(root)).replace(os.sep, "/")
-        date_hint = guess_date_hint(image_path.relative_to(root))
-        images.append(
-            {
-                "name": image_path.name,
-                "path": rel_path,
-                "dateHint": date_hint,
-                "size": image_path.stat().st_size,
-            }
-        )
-
-    next_image = next_folder_first_image(root, target)
-
-    return {
-        "path": relative,
-        "breadcrumbs": build_breadcrumbs(root, target),
-        "directories": directories,
-        "images": images,
-        "totalImages": len(images),
-        "nextFolderImage": (
-            str(next_image.relative_to(root)).replace(os.sep, "/") if next_image else None
-        ),
-    }
-
-
-def search_directories(root: Path, query: str, limit: int = 50) -> List[Dict[str, str]]:
-    normalized_query = _normalize_search_text(query)
-    if not normalized_query:
-        return []
-
-    query_tokens = [token for token in normalized_query.split(" ") if token]
-    if not query_tokens:
-        return []
-
-    results: List[Dict[str, str]] = []
-    seen_paths: set[str] = set()
-
-    for current_root, dirs, _files in os.walk(root):
-        dirs[:] = [d for d in dirs if not is_ignored_name(d)]
-        for directory in sorted(dirs, key=str.lower):
-            dir_path = Path(current_root) / directory
-            relative = str(dir_path.relative_to(root)).replace(os.sep, "/")
-            hint = guess_date_hint(dir_path.relative_to(root))
-            has_date, date_value = _extract_date_value(Path(relative))
-            haystack = _build_search_haystack(
-                (relative, directory, hint or ""),
-                date_value if has_date else None,
-            )
-            if haystack and all(token in haystack for token in query_tokens):
-                if relative not in seen_paths:
-                    seen_paths.add(relative)
-                    results.append({"name": directory, "path": relative})
-                if len(results) >= limit:
-                    return results
-
-    if len(results) < limit:
-        for image_path in iter_images_recursive(root):
-            relative = str(image_path.relative_to(root)).replace(os.sep, "/")
-            hint = guess_date_hint(image_path.relative_to(root))
-            has_date, date_value = _extract_date_value(Path(relative))
-            haystack = _build_search_haystack(
-                (
-                    relative,
-                    image_path.name,
-                    image_path.parent.name,
-                    hint or "",
-                ),
-                date_value if has_date else None,
-            )
-            if haystack and all(token in haystack for token in query_tokens):
-                directory_path = str(image_path.parent.relative_to(root)).replace(os.sep, "/")
-                if directory_path not in seen_paths:
-                    seen_paths.add(directory_path)
-                    results.append({"name": image_path.parent.name, "path": directory_path})
-                if len(results) >= limit:
-                    break
-    return results
-
-
-def _extract_date_value(rel_path: Path) -> tuple[bool, int]:
-    text = str(rel_path)
-    tokens = [tok for tok in re.split(r"\D+", text) if tok]
-    for idx, token in enumerate(tokens):
-        if len(token) == 4 and token.startswith(("19", "20")):
-            year = token
-            month = "00"
-            day = "00"
-            if idx + 1 < len(tokens) and len(tokens[idx + 1]) == 2:
-                candidate_month = int(tokens[idx + 1])
-                if 1 <= candidate_month <= 12:
-                    month = f"{candidate_month:02d}"
-                    if idx + 2 < len(tokens) and len(tokens[idx + 2]) == 2:
-                        candidate_day = int(tokens[idx + 2])
-                        if 1 <= candidate_day <= 31:
-                            day = f"{candidate_day:02d}"
-            return True, int(f"{year}{month}{day}")
-    return False, 0
-
-
-DATE_TOKEN_PATTERN = re.compile(r"(?P<year>(?:19|20)\d{2})(?P<sep>[-_/]?)(?P<month>\d{2})(?P=sep)?(?P<day>\d{2})")
-
-def _parse_date_label(text: str) -> Optional[datetime]:
-    normalized = (text or "").strip()
-    if not normalized:
-        return None
-
-    def build_date(year: int, month: int, day: int) -> Optional[datetime]:
-        try:
-            return datetime(year, month, day)
-        except ValueError:
-            return None
-
-    cleaned = normalized.replace("_", "-").replace("/", "-").replace(".", "-")
-    match = re.fullmatch(r"(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})", cleaned)
-    if match:
-        return build_date(int(match.group("year")), int(match.group("month")), int(match.group("day")))
-
-    digits = re.sub(r"\D", "", normalized)
-    if len(digits) >= 8:
-        year = int(digits[:4])
-        month = int(digits[4:6])
-        day = int(digits[6:8])
-        parsed = build_date(year, month, day)
-        if parsed:
-            return parsed
-
-    for fmt in ("%B %d %Y", "%b %d %Y", "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"):
-        try:
-            return datetime.strptime(normalized, fmt)
-        except ValueError:
-            continue
-
-    return None
-
-
-def format_display_date(label: str) -> Optional[str]:
-    date_obj = _parse_date_label(label)
-    if not date_obj:
-        return None
-    return f"{date_obj:%B} {date_obj.day}, {date_obj.year}"
-
-
-def format_date_value(value: int) -> Optional[str]:
-    if not isinstance(value, int) or value <= 0:
-        return None
-    year = value // 10000
-    month = (value % 10000) // 100
-    day = value % 100
-    try:
-        return datetime(year, month, day).strftime("%B %d, %Y").replace(" 0", " ")
-    except ValueError:
-        return None
-
-
-_SEARCH_SANITIZE_PATTERN = re.compile(r"[^0-9a-z]+")
-_MONTH_NAMES = (
-    "",
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
-)
-
-_MONTH_ABBREVIATIONS = (
-    "",
-    "jan",
-    "feb",
-    "mar",
-    "apr",
-    "may",
-    "jun",
-    "jul",
-    "aug",
-    "sep",
-    "oct",
-    "nov",
-    "dec",
-)
-
-
-def _normalize_search_text(value: object) -> str:
-    text = _SEARCH_SANITIZE_PATTERN.sub(" ", str(value or "").lower())
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def _date_tokens_from_value(date_value: int) -> List[str]:
-    if not isinstance(date_value, int) or date_value <= 0:
-        return []
-    year = date_value // 10000
-    month = (date_value % 10000) // 100
-    day = date_value % 100
-    if not (1 <= month <= 12 and 1 <= day <= 31 and year > 0):
-        return []
-    padded_month = f"{month:02d}"
-    padded_day = f"{day:02d}"
-    tokens = [
-        f"{year:04d}{padded_month}{padded_day}",
-        f"{year:04d} {padded_month} {padded_day}",
-        f"{padded_month} {padded_day} {year:04d}",
-        f"{padded_day} {padded_month} {year:04d}",
-    ]
-    month_name = _MONTH_NAMES[month]
-    month_abbr = _MONTH_ABBREVIATIONS[month]
-    if month_name:
-        tokens.append(f"{month_name} {day} {year}")
-        tokens.append(f"{day} {month_name} {year}")
-    if month_abbr:
-        tokens.append(f"{month_abbr} {day} {year}")
-        tokens.append(f"{day} {month_abbr} {year}")
-    return tokens
-
-
-def _build_search_haystack(parts: Iterable[object], date_value: Optional[int] = None) -> str:
-    tokens: List[str] = []
-    for part in parts:
-        normalized_part = _normalize_search_text(part)
-        if normalized_part:
-            tokens.append(normalized_part)
-
-    extras: List[str] = []
-    if isinstance(date_value, int) and date_value > 0:
-        extras = _date_tokens_from_value(date_value)
-
-    if not extras:
-        for part in parts:
-            parsed = _parse_date_label(str(part))
-            if parsed:
-                fallback_value = parsed.year * 10000 + parsed.month * 100 + parsed.day
-                extras = _date_tokens_from_value(fallback_value)
-                if extras:
-                    break
-
-    for extra in extras:
-        normalized_extra = _normalize_search_text(extra)
-        if normalized_extra:
-            tokens.append(normalized_extra)
-
-    if not tokens:
-        return ""
-
-    deduped = list(dict.fromkeys(tokens))
-    return " ".join(deduped)
-
-
-def _clean_exif_string(value: str) -> str:
-    cleaned = value.replace("\x00", " ")
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
-
-
-def _normalize_exif_value(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        for encoding in ("utf-8", "latin-1"):
-            try:
-                decoded = value.decode(encoding, errors="ignore")
-                if decoded:
-                    return _clean_exif_string(decoded)
-            except Exception:  # noqa: BLE001 - defensive decode guard
-                continue
-        return value.hex()
-    if isinstance(value, (list, tuple, set)):
-        parts = [_normalize_exif_value(part) for part in value]
-        filtered = [part for part in parts if part]
-        return ", ".join(filtered)
-    if isinstance(value, dict):
-        pieces = []
-        for key, sub_value in value.items():
-            normalized = _normalize_exif_value(sub_value)
-            if normalized:
-                pieces.append(f"{key}: {normalized}")
-        return "; ".join(pieces)
-    return _clean_exif_string(str(value))
-
-
-def _read_exif_fields(image_path: Path) -> List[Dict[str, str]]:
-    try:
-        with Image.open(image_path) as img:
-            exif_data = img.getexif()
-    except Exception:  # noqa: BLE001 - return empty on parse errors
-        return []
-
-    if not exif_data:
-        return []
-
-    merged: Dict[str, List[str]] = {}
-    
-    def process_ifd(mapping, tag_lookup: Dict[int, str], prefix: Optional[str] = None) -> None:
-        if not mapping:
-            return
-        for tag_id, raw_value in mapping.items():
-            tag_name = tag_lookup.get(tag_id) or EXIF_TAGS.get(tag_id) or f"Tag {tag_id}"
-            if tag_name in _EXIF_IGNORED_TAGS:
-                continue
-            normalized = _normalize_exif_value(raw_value)
-            if not normalized:
-                continue
-            if len(normalized) > 500:
-                normalized = normalized[:497] + "…"
-            label = f"{prefix}{tag_name}" if prefix else tag_name
-            entries = merged.setdefault(label, [])
-            if normalized not in entries:
-                entries.append(normalized)
-
-    process_ifd(exif_data, EXIF_TAGS)
-
-    if hasattr(exif_data, "get_ifd"):
-        ifd_namespace = getattr(ExifTags, "IFD", None)
-        if ifd_namespace is not None:
-            ifd_candidates = [
-                ("Exif", getattr(ifd_namespace, "Exif", None), EXIF_TAGS, None),
-                ("GPSInfo", getattr(ifd_namespace, "GPSInfo", None), GPS_TAGS or EXIF_TAGS, None),
-                ("Interoperability", getattr(ifd_namespace, "Interoperability", None), EXIF_TAGS, None),
-                ("1st", getattr(ifd_namespace, "IFD1", None) if hasattr(ifd_namespace, "IFD1") else getattr(ifd_namespace, "First", None), EXIF_TAGS, None),
-            ]
-            for name, ifd_id, lookup, prefix in ifd_candidates:
-                if not ifd_id:
-                    continue
-                try:
-                    ifd_mapping = exif_data.get_ifd(ifd_id)
-                except Exception:  # noqa: BLE001 - ignore missing IFDs
-                    continue
-                process_ifd(ifd_mapping, lookup, prefix)
-
-    gps_block = exif_data.get(ExifTags.IFD.GPSInfo) if hasattr(ExifTags, "IFD") else None
-    if gps_block and isinstance(gps_block, dict):
-        process_ifd(gps_block, GPS_TAGS or EXIF_TAGS)
-
-    fields = [
-        {"label": label, "value": "; ".join(values)}
-        for label, values in merged.items()
-    ]
-    fields.sort(key=lambda entry: entry["label"].lower())
-    return fields
-
-
-def get_exif_metadata(root: Path, relative: str) -> List[Dict[str, str]]:
-    normalized_relative = relative.replace("\\", "/").lstrip("/")
-    cache_key = f"{root}:{normalized_relative}"
-    now = time.time()
-    cached = _EXIF_CACHE.get(cache_key)
-    if cached and now - cached[0] < EXIF_CACHE_TTL_SECONDS:
-        return cached[1]
-
-    target = resolve_relative_path(root, normalized_relative)
-    if not target.is_file():
-        raise FileNotFoundError
-
-    fields = _read_exif_fields(target)
-    if len(_EXIF_CACHE) > 1024:
-        _EXIF_CACHE.clear()
-    _EXIF_CACHE[cache_key] = (now, fields)
-    return fields
-
-
-def sanitize_zip_component(component: str, fallback: str = "item") -> str:
-    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", component).strip()
-    cleaned = cleaned.replace("\0", "_")
-    if not cleaned:
-        return fallback
-    return cleaned
-
-
-def _is_year_label(text: object) -> bool:
-    if not isinstance(text, str):
-        return False
-    stripped = text.strip()
-    return len(stripped) == 4 and stripped.isdigit()
-
-
-def _sorted_image_paths_db(order: str) -> List[str]:
-    documents = _fetch_database_documents()
-    dated: List[tuple[int, str]] = []
-    undated: List[str] = []
-    for doc in documents:
-        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
-        if not relative:
-            continue
-        rel_path = PurePosixPath(relative)
-        subgroup_label = str(doc.get("subgroupLabel") or rel_path.parent.name or rel_path.name)
-        _manifest, has_date, date_value = _build_manifest_entry(
-            rel_path, relative, subgroup_label, doc
-        )
-        if has_date and date_value:
-            dated.append((date_value, relative))
-        else:
-            undated.append(relative)
-
-    dated.sort(key=lambda item: (item[0], item[1].lower()))
-    undated.sort(key=lambda path: path.lower())
-    ordered = [path for _value, path in dated] + undated
-
-    if order == "asc":
-        return ordered
-
-    dated_paths = []
-    undated_paths = []
-    for path in ordered:
-        has_date, _ = _extract_date_value(PurePosixPath(path))
-        if has_date:
-            dated_paths.append(path)
-        else:
-            undated_paths.append(path)
-    dated_paths.reverse()
-    return dated_paths + undated_paths
-
-
-def sorted_image_paths(root: Path, order: str = "desc") -> List[str]:
-    if using_database():
-        return _sorted_image_paths_db(order)
-    cache_root = _IMAGE_CACHE["root"]
-    now = time.time()
-    if cache_root == root and now - float(_IMAGE_CACHE["generated"]) < IMAGE_CACHE_TTL_SECONDS:
-        cache_paths = list(_IMAGE_CACHE["paths"])
-    else:
-        dated: List[tuple[int, str]] = []
-        undated: List[str] = []
-        for image_path in iter_images_recursive(root):
-            relative = str(image_path.relative_to(root)).replace(os.sep, "/")
-            has_date, value = _extract_date_value(Path(relative))
-            if has_date:
-                dated.append((value, relative))
-            else:
-                undated.append(relative)
-
-        dated.sort(key=lambda item: (item[0], item[1].lower()))
-        undated.sort(key=lambda path: path.lower())
-        cache_paths = [path for _value, path in dated] + undated
-
-        _IMAGE_CACHE["root"] = root
-        _IMAGE_CACHE["generated"] = now
-        _IMAGE_CACHE["paths"] = cache_paths
-
-    if order == "asc":
-        return list(cache_paths)
-
-    dated_paths = []
-    undated_paths = []
-    for path in cache_paths:
-        has_date, _ = _extract_date_value(Path(path))
-        if has_date:
-            dated_paths.append(path)
-        else:
-            undated_paths.append(path)
-    dated_paths.reverse()
-    return dated_paths + undated_paths
-
-
-def timeline_sections(
-    root: Path, cursor: Optional[str], limit: int, order: str = "desc"
-) -> Dict[str, object]:
-    paths = sorted_image_paths(root, order)
-    if not paths:
-        return {"sections": [], "nextCursor": None}
-
-    start_index = 0
-    if cursor:
-        cursor = cursor.replace(os.sep, "/")
-        try:
-            start_index = paths.index(cursor) + 1
-        except ValueError:
-            start_index = 0
-
-    slice_paths = paths[start_index : start_index + limit]
-    if not slice_paths:
-        return {"sections": [], "nextCursor": None}
-
-    sections: List[Dict[str, object]] = []
-    current_label: Optional[str] = None
-    current_items: List[Dict[str, object]] = []
-
-    for rel_path_str in slice_paths:
-        rel_path = Path(rel_path_str)
-        hint = guess_date_hint(rel_path)
-        label = hint or rel_path.parent.name or "Unknown"
-        if label != current_label:
-            if current_items:
-                sections.append({"label": current_label, "items": current_items})
-            current_label = label
-            current_items = []
-        current_items.append(
-            {
-                "name": rel_path.name,
-                "path": rel_path_str,
-                "dateHint": hint or label,
-            }
-        )
-
-    if current_items:
-        sections.append({"label": current_label, "items": current_items})
-
-    next_cursor = None
-    if start_index + len(slice_paths) < len(paths):
-        next_cursor = slice_paths[-1]
-
-    return {"sections": sections, "nextCursor": next_cursor}
-
-
-def _build_manifest_entry(
-    rel_path: PurePosixPath,
-    relative: str,
-    subgroup_label: str,
-    doc: Dict[str, object],
-) -> Tuple[Dict[str, object], bool, int]:
-    date_value = int(doc.get("dateValue") or 0)
-    has_date = bool(date_value and doc.get("date_specific", True))
-    if not date_value:
-        iso_value = _date_value_from_iso(doc.get("image_datetime"))
-        if iso_value:
-            date_value = iso_value
-            has_date = bool(doc.get("date_specific", True))
-    if not date_value:
-        extracted_has_date, extracted_value = _extract_date_value(rel_path)
-        if extracted_has_date:
-            has_date = True
-            date_value = extracted_value
-    date_hint = guess_date_hint(Path(rel_path)) or subgroup_label
-    manifest_entry = {
-        "name": rel_path.name,
-        "path": relative,
-        "dateHint": date_hint,
-        "dateValue": date_value,
-        "hasDate": has_date,
-    }
-    return manifest_entry, has_date, date_value
-
-
-def _accumulate_documents(
-    documents: List[Dict[str, object]],
-    *,
-    include_images: bool = True,
-    group_filter: Optional[str] = None,
-) -> Tuple[Dict[str, Dict[str, object]], Dict[str, Counter], Optional[Dict[str, List[Dict[str, object]]]]]:
-    top_groups: Dict[str, Dict[str, object]] = {}
-    location_counts: Dict[str, Counter] = {}
-    images_by_group: Optional[Dict[str, List[Dict[str, object]]]] = {} if include_images else None
-
-    for doc in documents:
-        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
-        if not relative:
-            continue
-        rel_path = PurePosixPath(relative)
-        parts = rel_path.parts
-        if not parts:
-            continue
-
-        top_key = str(doc.get("topKey") or parts[0])
-        top_label = top_key
-        if len(parts) >= 2:
-            subgroup_key = str(doc.get("subgroupKey") or f"{parts[0]}/{parts[1]}")
-            subgroup_label = str(doc.get("subgroupLabel") or parts[1])
-        else:
-            subgroup_key = str(doc.get("subgroupKey") or top_key)
-            subgroup_label = str(doc.get("subgroupLabel") or top_label)
-
-        if group_filter and subgroup_key != group_filter:
-            continue
-
-        manifest_entry, has_date, date_value = _build_manifest_entry(
-            rel_path, relative, subgroup_label, doc
-        )
-
-        if include_images and images_by_group is not None:
-            images_by_group.setdefault(subgroup_key, []).append(manifest_entry)
-
-        top_entry = _update_group_summary(top_groups, top_key, top_label, has_date, date_value)
-        _update_group_summary(top_entry["subgroups"], subgroup_key, subgroup_label, has_date, date_value)
-
-        location_label = _format_location_label(doc.get("location"))
-        if location_label:
-            location_counts.setdefault(subgroup_key, Counter())[location_label] += 1
-
-    return top_groups, location_counts, images_by_group
-
-
-def _update_group_summary(
-    summary: Dict[str, object],
-    key: str,
-    label: str,
-    has_date: bool,
-    date_value: int,
-) -> Dict[str, object]:
-    record = summary.setdefault(
-        key,
-        {
-            "key": key,
-            "label": label,
-            "count": 0,
-            "maxDate": 0,
-            "subgroups": {},
-        },
-    )
-    record["count"] = int(record.get("count", 0)) + 1
-    if has_date:
-        record["maxDate"] = max(int(record.get("maxDate", 0)), date_value)
-    return record
-
-
-def _finalize_top_groups(
-    top_groups: Dict[str, Dict[str, object]],
-    location_counts: Dict[str, Counter],
-) -> List[Dict[str, object]]:
-    top_group_list: List[Dict[str, object]] = []
-    for top_entry in top_groups.values():
-        subgroups_values = top_entry["subgroups"].values()
-        subgroups_payload: List[Dict[str, object]] = []
-        for sub in subgroups_values:
-            max_date_value = int(sub.get("maxDate", 0))
-            formatted_label = (
-                format_date_value(max_date_value)
-                or format_display_date(str(sub.get("label")))
-                or str(sub.get("label"))
-            )
-            payload: Dict[str, object] = {
-                "key": sub["key"],
-                "label": sub["label"],
-                "formattedLabel": formatted_label,
-                "count": sub["count"],
-                "dateValue": max_date_value,
-            }
-            counter = location_counts.get(sub["key"])
-            if counter:
-                payload["location"] = counter.most_common(1)[0][0]
-            subgroups_payload.append(payload)
-        subgroups_payload.sort(
-            key=lambda item: (item["dateValue"], item["key"]), reverse=True
-        )
-        formatted_top_label = (
-            format_display_date(str(top_entry["label"]))
-            or str(top_entry["label"])
-        )
-        if not _is_year_label(top_entry["label"]):
-            top_entry["maxDate"] = 0
-        top_group_list.append(
-            {
-                "key": top_entry["key"],
-                "label": top_entry["label"],
-                "formattedLabel": formatted_top_label,
-                "count": top_entry["count"],
-                "dateValue": top_entry["maxDate"],
-                "subgroups": subgroups_payload,
-            }
-        )
-    top_group_list.sort(key=lambda item: (item["dateValue"], item["key"]), reverse=True)
-    return top_group_list
-
-
-def _order_groups(top_groups: Sequence[Dict[str, object]], order: str) -> List[Dict[str, object]]:
-    normalized = order if order in {"asc", "desc"} else "desc"
-    reverse = normalized == "desc"
-
-    ordered_groups: List[Dict[str, object]] = []
-    for group in sorted(
-        top_groups,
-        key=lambda item: (item.get("dateValue", 0), item.get("key")),
-        reverse=reverse,
-    ):
-        subgroups = group.get("subgroups", []) or []
-        subgroups_ordered = sorted(
-            subgroups,
-            key=lambda item: (item.get("dateValue", 0), item.get("key")),
-            reverse=reverse,
-        )
-        ordered_groups.append(
-            {
-                "key": group.get("key"),
-                "label": group.get("label"),
-                "formattedLabel": group.get("formattedLabel"),
-                "count": group.get("count", 0),
-                "dateValue": group.get("dateValue", 0),
-                "subgroups": subgroups_ordered,
-            }
-        )
-
-    return ordered_groups
-
-
-def _build_hierarchy_db(include_images: bool = True) -> Dict[str, object]:
-    documents = _fetch_database_documents()
-    top_groups, location_counts, images_by_group = _accumulate_documents(
-        documents,
-        include_images=include_images,
-    )
-
-    if include_images and images_by_group is not None:
-        for manifest in images_by_group.values():
-            manifest.sort(
-                key=lambda item: (
-                    1 if item.get("hasDate") else 0,
-                    item.get("dateValue", 0),
-                    (item.get("path") or "").lower(),
-                ),
-                reverse=True,
-            )
-
-    result: Dict[str, object] = {
-        "top_groups": _finalize_top_groups(top_groups, location_counts),
-    }
-    if include_images and images_by_group is not None:
-        result["images_by_group"] = images_by_group
-    return result
-
-
-def random_pool_payload(
-    root: Path,
-    start: Optional[int],
-    end: Optional[int],
-    order: str,
-    limit: int,
-) -> Dict[str, object]:
-    normalized = order if order in {"asc", "desc"} else "desc"
-    sort_direction = -1 if normalized == "desc" else 1
-
-    post_match: Dict[str, object] = {}
-    if isinstance(start, int) and start > 0:
-        post_match.setdefault("dateValue", {})["$gte"] = start
-    if isinstance(end, int) and end > 0:
-        post_match.setdefault("dateValue", {})["$lte"] = end
-
-    documents = _aggregate_documents(
-        post_match=post_match or None,
-        sort_direction=sort_direction,
-        limit=max(1, min(limit, 20_000)),
-    )
-
-    images: List[Dict[str, object]] = []
-    for doc in documents:
-        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
-        if not isinstance(relative, str):
-            continue
-        rel_path = PurePosixPath(relative)
-        parts = rel_path.parts
-        if not parts:
-            continue
-        top_key = str(doc.get("topKey") or parts[0])
-        if len(parts) >= 2:
-            subgroup_key = str(doc.get("subgroupKey") or f"{parts[0]}/{parts[1]}")
-        else:
-            subgroup_key = str(doc.get("subgroupKey") or top_key)
-
-        images.append(
-            {
-                "path": relative,
-                "groupKey": subgroup_key,
-                "topKey": top_key,
-                "dateValue": doc.get("dateValue") or 0,
-                "dateHint": doc.get("subgroupLabel") or doc.get("relative"),
-            }
-        )
-
-    return {"images": images, "order": normalized}
-
-
-def build_hierarchy(root: Path) -> Dict[str, object]:
-    if using_database():
-        return _build_hierarchy_db()
-    cache_root = _IMAGE_CACHE.get("hierarchy_root")
-    now = time.time()
-    cached_hierarchy = _IMAGE_CACHE.get("hierarchy")
-    if (
-        cached_hierarchy
-        and cache_root == root
-        and now - float(_IMAGE_CACHE.get("hierarchy_generated", 0.0)) < IMAGE_CACHE_TTL_SECONDS
-    ):
-        return cached_hierarchy
-
-    top_groups: Dict[str, Dict[str, object]] = {}
-    images_by_group: Dict[str, List[Dict[str, object]]] = {}
-
-    for image_path in iter_images_recursive(root):
-        relative_str = str(image_path.relative_to(root)).replace(os.sep, "/")
-        rel_path = Path(relative_str)
-        parts = rel_path.parts
-        if not parts:
-            continue
-
-        top_key = parts[0]
-        top_label = top_key
-        if len(parts) >= 2:
-            subgroup_key = f"{parts[0]}/{parts[1]}"
-            subgroup_label = parts[1]
-        else:
-            subgroup_key = top_key
-            subgroup_label = top_label
-
-        has_date, date_value = _extract_date_value(rel_path)
-        date_hint = guess_date_hint(rel_path) or subgroup_label
-
-        image_item = {
-            "name": rel_path.name,
-            "path": relative_str,
-            "dateHint": date_hint,
-            "dateValue": date_value,
-            "hasDate": has_date,
-        }
-
-        images_by_group.setdefault(subgroup_key, []).append(image_item)
-
-        top_entry = top_groups.setdefault(
-            top_key,
-            {
-                "key": top_key,
-                "label": top_label,
-                "count": 0,
-                "maxDate": 0,
-                "subgroups": {},
-            },
-        )
-        top_entry["count"] += 1
-        if has_date:
-            top_entry["maxDate"] = max(top_entry["maxDate"], date_value)
-
-        subgroup_entry = top_entry["subgroups"].setdefault(
-            subgroup_key,
-            {
-                "key": subgroup_key,
-                "label": subgroup_label,
-                "count": 0,
-                "maxDate": 0,
-            },
-        )
-        subgroup_entry["count"] += 1
-        if has_date:
-            subgroup_entry["maxDate"] = max(subgroup_entry["maxDate"], date_value)
-
-    for group_key, image_list in images_by_group.items():
-        image_list.sort(
-            key=lambda item: (
-                1 if item["hasDate"] else 0,
-                item["dateValue"],
-                item["path"].lower(),
-            ),
-            reverse=True,
-        )
-
-    top_group_list: List[Dict[str, object]] = []
-    for top_entry in top_groups.values():
-        subgroups_raw = top_entry["subgroups"].values()
-        subgroups_list: List[Dict[str, object]] = []
-        for sub in subgroups_raw:
-            formatted_label = format_date_value(sub.get("maxDate", 0)) or format_display_date(sub["label"]) or sub["label"]
-            subgroup_payload: Dict[str, object] = {
-                "key": sub["key"],
-                "label": sub["label"],
-                "formattedLabel": formatted_label,
-                "count": sub["count"],
-                "dateValue": sub["maxDate"],
-            }
-            subgroups_list.append(subgroup_payload)
-        subgroups_list.sort(
-            key=lambda item: (item["dateValue"], item["key"]), reverse=True
-        )
-        formatted_top_label = format_display_date(top_entry["label"]) or top_entry["label"]
-        if not _is_year_label(top_entry["label"]):
-            top_entry["maxDate"] = 0
-        top_group_list.append(
-            {
-                "key": top_entry["key"],
-                "label": top_entry["label"],
-                "formattedLabel": formatted_top_label,
-                "count": top_entry["count"],
-                "dateValue": top_entry["maxDate"],
-                "subgroups": subgroups_list,
-            }
-        )
-
-    top_group_list.sort(
-        key=lambda item: (item["dateValue"], item["key"]), reverse=True
-    )
-
-    hierarchy = {
-        "top_groups": top_group_list,
-        "images_by_group": images_by_group,
-    }
-
-    _IMAGE_CACHE["hierarchy_root"] = root
-    _IMAGE_CACHE["hierarchy_generated"] = now
-    _IMAGE_CACHE["hierarchy"] = hierarchy
-    return hierarchy
-
-
-def hierarchy_payload(root: Path, order: str) -> Dict[str, object]:
-    normalized = order.lower()
-    if normalized not in {"asc", "desc"}:
-        normalized = "desc"
-
-    if using_database():
-        data = _build_hierarchy_db(include_images=True)
-    else:
-        data = build_hierarchy(root)
-
-    top_groups = data["top_groups"]
-    ordered_groups = _order_groups(top_groups, normalized)
-    images_by_group = data.get("images_by_group", {}) or {}
-
-    images_payload: Dict[str, List[Dict[str, object]]] = {}
-    for group_key, image_list in images_by_group.items():
-        sequence = image_list if normalized == "desc" else list(reversed(image_list))
-        images_payload[group_key] = [
-            {
-                "name": item.get("name"),
-                "path": item.get("path"),
-                "dateHint": item.get("dateHint"),
-                "dateValue": item.get("dateValue"),
-            }
-            for item in sequence
-        ]
-
-    return {
-        "groups": ordered_groups,
-        "imagesByGroup": images_payload,
-        "order": normalized,
-    }
-
-
-def groups_payload(root: Path, order: str) -> Dict[str, object]:
-    normalized = order.lower()
-    if normalized not in {"asc", "desc"}:
-        normalized = "desc"
-
-    if using_database():
-        data = _build_hierarchy_db(include_images=False)
-        top_groups = data.get("top_groups", [])
-    else:
-        data = build_hierarchy(root)
-        top_groups = data["top_groups"]
-
-    ordered_groups = _order_groups(top_groups, normalized)
-    return {"groups": ordered_groups, "order": normalized}
-
-
-def group_images_payload(
-    root: Path,
-    group_key: str,
-    cursor: Optional[str],
-    limit: int,
-    order: str,
-) -> Dict[str, object]:
-    normalized = order.lower()
-    if normalized not in {"asc", "desc"}:
-        normalized = "desc"
-
-    if using_database():
-        return _group_images_payload_db(group_key, cursor, limit, normalized)
-
-    data = build_hierarchy(root)
-    images = data["images_by_group"].get(group_key)
-    if images is None:
-        return {"images": [], "nextCursor": None}
-
-    sequence = images if normalized == "desc" else list(reversed(images))
-    start_index = 0
-    if cursor:
-        cursor = cursor.replace(os.sep, "/")
-        for idx, item in enumerate(sequence):
-            if item["path"] == cursor:
-                start_index = idx + 1
-                break
-
-    slice_items = sequence[start_index : start_index + limit]
-    if not slice_items:
-        return {"images": [], "nextCursor": None}
-
-    response_images = [
-        {
-            "name": item["name"],
-            "path": item["path"],
-            "dateHint": item.get("dateHint"),
-            "dateValue": item.get("dateValue"),
-        }
-        for item in slice_items
-    ]
-
-    next_cursor = None
-    if start_index + len(slice_items) < len(sequence):
-        next_cursor = slice_items[-1]["path"]
-
-    return {"images": response_images, "nextCursor": next_cursor}
-
-
-def _group_images_payload_db(
-    group_key: str,
-    cursor: Optional[str],
-    limit: int,
-    order: str,
-) -> Dict[str, object]:
-    sort_direction = -1 if order == "desc" else 1
-    documents = _aggregate_documents(post_match={"subgroupKey": group_key}, sort_direction=sort_direction)
-    if not documents:
-        return {"images": [], "nextCursor": None}
-
-    manifest: List[Dict[str, object]] = []
-    for doc in documents:
-        relative = doc.get("relative") or _relative_path_from_id(doc.get("_id"))
-        if not relative:
-            continue
-        rel_path = PurePosixPath(relative)
-        parts = rel_path.parts
-        subgroup_label = str(doc.get("subgroupLabel") or (parts[1] if len(parts) >= 2 else parts[0]))
-        manifest_entry, _has_date, _date_value = _build_manifest_entry(rel_path, relative, subgroup_label, doc)
-        manifest.append(manifest_entry)
-
-    manifest.sort(
-        key=lambda item: (
-            1 if item.get("hasDate") else 0,
-            item.get("dateValue", 0),
-            (item.get("path") or "").lower(),
-        ),
-        reverse=True,
-    )
-    if order == "asc":
-        manifest = list(reversed(manifest))
-
-    start_index = 0
-    if cursor:
-        cursor_normalized = cursor.replace("\\", "/")
-        for idx, item in enumerate(manifest):
-            if item.get("path") == cursor_normalized:
-                start_index = idx + 1
-                break
-
-    slice_items = manifest[start_index : start_index + limit]
-    if not slice_items:
-        return {"images": [], "nextCursor": None}
-
-    next_cursor = None
-    if start_index + len(slice_items) < len(manifest):
-        next_cursor = slice_items[-1].get("path")
-
-    response_images = [
-        {
-            "name": item.get("name"),
-            "path": item.get("path"),
-            "dateHint": item.get("dateHint"),
-            "dateValue": item.get("dateValue"),
-        }
-        for item in slice_items
-        if item.get("path")
-    ]
-
-    return {"images": response_images, "nextCursor": next_cursor}
-
-
-def warm_cache(root: Path) -> None:
-    """Populate caches eagerly so first request isn't delayed."""
-    try:
-        sorted_image_paths(root, order="desc")
-        build_hierarchy(root)
-    except Exception as exc:  # noqa: BLE001 - cache warm failures shouldn't block startup
-        print(f"[WARN] Failed to warm caches: {exc}")
-
-
-def extract_exif_thumbnail(image_path: Path) -> Optional[bytes]:
-    try:
-        with Image.open(image_path) as img:
-            exif = img.getexif()
-            thumb = exif.thumbnail if exif else None
-            if thumb:
-                return thumb
-    except Exception:
-        return None
-    return None
-
-
-def thumbnail_cache_key(image_path: Path, max_size: int) -> str:
-    stat = image_path.stat()
-    fingerprint = f"{image_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{max_size}"
-    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
-
-
-def thumbnail_cache_path(image_path: Path, max_size: int) -> Path:
-    key = thumbnail_cache_key(image_path, max_size)
-    return THUMBNAIL_CACHE_DIR / f"{key}.jpg"
-
-
-def generate_thumbnail(image_path: Path, max_size: int) -> Optional[tuple[bytes, str]]:
-    exif_thumb = extract_exif_thumbnail(image_path)
-    if exif_thumb:
-        return exif_thumb, "image/jpeg"
-
-    cache_file = thumbnail_cache_path(image_path, max_size)
-    if cache_file.exists():
-        return cache_file.read_bytes(), "image/jpeg"
-
-    try:
-        with Image.open(image_path) as img:
-            img = ImageOps.exif_transpose(img)
-            thumb = img.copy()
-            thumb.thumbnail((max_size, max_size), Image.LANCZOS)
-            if thumb.mode == "RGBA":
-                background = Image.new("RGB", thumb.size, (16, 16, 16))
-                background.paste(thumb, mask=thumb.split()[3])
-                thumb = background
-            elif thumb.mode != "RGB":
-                thumb = thumb.convert("RGB")
-            buffer = io.BytesIO()
-            save_kwargs = {"optimize": True, "quality": 82}
-            thumb.save(buffer, "JPEG", **save_kwargs)
-    except Exception:
-        return None
-
-    data = buffer.getvalue()
-    THUMBNAIL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file.write_bytes(data)
-    return data, "image/jpeg"
+APP_CONFIG = AppConfig()
+IMAGE_REPOSITORY = ImageRepository(None)
+HOLIDAY_REPOSITORY = HolidayRepository(None)
+HIERARCHY_SERVICE = HierarchyService(IMAGE_REPOSITORY)
+MONGO_CLIENT: Optional["MongoClient"] = None
 
 
 class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
-    root_path: Path = DEFAULT_ROOT
-    mongo_collection: Optional["Collection"] = None
-    mongo_client: Optional["MongoClient"] = None
+    config: AppConfig = APP_CONFIG
+    image_repository: ImageRepository = IMAGE_REPOSITORY
+    holiday_repository: HolidayRepository = HOLIDAY_REPOSITORY
+    hierarchy_service: HierarchyService = HIERARCHY_SERVICE
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
 
+    @property
+    def root_path(self) -> Path:
+        return self.config.root
+
     def do_GET(self) -> None:  # noqa: N802 - standard library signature
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
-            self.handle_api(parsed)
+            params = parse_qs(parsed.query or "")
+            self.handle_api(parsed.path, params)
             return
         if parsed.path in {"", "/"}:
             self.serve_index()
             return
         super().do_GET()
 
-    def do_POST(self) -> None:  # noqa: N802 - standard library signature
+    def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/api/download":
             self.api_download()
             return
+        if parsed.path == "/api/images-by-dates":
+            self.api_images_by_dates()
+            return
         self.send_error(HTTPStatus.METHOD_NOT_ALLOWED, "Unsupported POST endpoint")
 
-    # API handlers
-    def handle_api(self, parsed) -> None:
-        route = parsed.path
-        params = parse_qs(parsed.query or "")
+    # API handlers -----------------------------------------------------
+    def handle_api(self, route: str, params: Dict[str, List[str]]) -> None:
+        print(f"[HTTP] GET {route} params={params}")
         try:
             if route == "/api/list":
                 self.api_list(params)
@@ -1619,18 +118,19 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.api_group_images(params)
             elif route == "/api/timeline":
                 self.api_timeline(params)
+            elif route == "/api/holiday-dates":
+                self.api_holiday_dates(params)
             else:
                 self.send_json({"error": "Unknown endpoint"}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except FileNotFoundError:
             self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
-        except Exception as exc:  # noqa: BLE001 - report unexpected errors
+        except Exception as exc:  # noqa: BLE001 - defensive catch
             self.send_json({"error": f"Unexpected server error: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def api_list(self, params: Dict[str, List[str]]) -> None:
-        relative = params.get("path", [""])[0]
-        relative = unquote(relative)
+        relative = unquote(params.get("path", [""])[0])
         target = resolve_relative_path(self.root_path, relative)
         if not target.exists():
             raise FileNotFoundError
@@ -1638,6 +138,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             target = target.parent
         payload = directory_payload(self.root_path, target)
         self.send_json(payload)
+
 
     def api_image(self, params: Dict[str, List[str]]) -> None:
         relative = params.get("path", [""])[0]
@@ -1648,13 +149,14 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             raise FileNotFoundError
         self.send_file(target)
 
+
     def api_thumbnail(self, params: Dict[str, List[str]]) -> None:
         relative = params.get("path", [""])[0]
         if not relative:
             raise ValueError("Missing image path")
         size_param = params.get("size", [""])[0]
         try:
-            max_size = int(size_param) if size_param else THUMBNAIL_DEFAULT_SIZE
+            max_size = int(size_param) if size_param else self.config.thumbnail_size
         except ValueError as exc:
             raise ValueError("Invalid thumbnail size") from exc
         max_size = max(32, min(1024, max_size))
@@ -1674,6 +176,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         data, content_type = result
         self.send_binary(data, content_type)
 
+
     def api_download(self) -> None:
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -1687,7 +190,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         try:
             raw_body = self.rfile.read(length)
-        except Exception as exc:  # noqa: BLE001 - stream errors
+        except Exception as exc:  # noqa: BLE001
             self.send_json({"error": f"Unable to read request body: {exc}"}, status=HTTPStatus.BAD_REQUEST)
             return
 
@@ -1697,6 +200,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json({"error": f"Invalid JSON: {exc}"}, status=HTTPStatus.BAD_REQUEST)
             return
 
+        print(f"[HTTP] POST /api/download length={length} payload={payload}")
         paths = payload.get("paths") if isinstance(payload, dict) else None
         if not isinstance(paths, list) or not paths:
             self.send_json({"error": "No images selected"}, status=HTTPStatus.BAD_REQUEST)
@@ -1705,8 +209,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         normalized: List[str] = []
         for item in paths:
             if isinstance(item, str) and item.strip():
-                candidate = item.replace("\\", "/").strip()
-                normalized.append(unquote(candidate))
+                normalized.append(unquote(item.replace("\\", "/").strip()))
 
         deduped = list(dict.fromkeys(normalized))
         if not deduped:
@@ -1715,11 +218,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         resolved: List[Tuple[str, Path]] = []
         for relative in deduped:
-            try:
-                target = resolve_relative_path(self.root_path, relative)
-            except ValueError:
-                self.send_json({"error": f"Invalid path: {relative}"}, status=HTTPStatus.BAD_REQUEST)
-                return
+            target = resolve_relative_path(self.root_path, relative)
             if not target.exists() or not target.is_file():
                 self.send_json({"error": f"File not found: {relative}"}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -1739,10 +238,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", content_type)
-                self.send_header(
-                    "Content-Disposition",
-                    f'attachment; filename="{filename}"',
-                )
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Content-Length", str(target.stat().st_size))
                 self.end_headers()
                 with target.open("rb") as file_obj:
@@ -1755,7 +251,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.log_message("Client closed connection while downloading %s", target)
             return
 
-        hierarchy = build_hierarchy(self.root_path)
+        hierarchy = self.hierarchy_service.build(self.root_path)
         group_lookup: Dict[str, Dict[str, object]] = {}
         for group in hierarchy.get("top_groups", []):
             for subgroup in group.get("subgroups", []):
@@ -1786,7 +282,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
                 for (relative, target), folder in zip(resolved, folder_sequence):
                     arcname = f"{folder}/{target.name}"
                     archive.write(target, arcname=arcname)
-        except Exception as exc:  # noqa: BLE001 - surface zip errors
+        except Exception as exc:  # noqa: BLE001
             self.send_json({"error": f"Failed to build archive: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
@@ -1794,10 +290,7 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         try:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/zip")
-            self.send_header(
-                "Content-Disposition",
-                f'attachment; filename="{zip_name}"',
-            )
+            self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -1806,33 +299,106 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def api_search(self, params: Dict[str, List[str]]) -> None:
         query = params.get("query", [""])[0]
-        results = search_directories(self.root_path, query, limit=75)
+        holiday_terms = params.get("holiday", [])
+        date_values: Sequence[int] = []
+        holiday_names: Dict[int, Sequence[str]] = {}
+        if holiday_terms:
+            values, names_by_value = self.holiday_repository.resolve_date_values(holiday_terms)
+            date_values = sorted(values)
+            holiday_names = {key: sorted(names) for key, names in names_by_value.items()}
+        results = search_directories(
+            self.root_path,
+            query,
+            limit=75,
+            holiday_date_values=date_values,
+            holiday_names_by_value=holiday_names,
+        )
+        print(f"[HTTP] /api/search results={len(results)}")
         self.send_json({"results": results})
+
+    def api_holiday_dates(self, params: Dict[str, List[str]]) -> None:
+        names = params.get("name", [])
+        print(f"[HTTP] /api/holiday-dates names={names}")
+        records = self.holiday_repository.resolve_records(names)
+        self.send_json({"results": records})
+
+    def api_images_by_dates(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self.send_json({"error": "Invalid Content-Length"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if length <= 0:
+            self.send_json({"error": "Request body required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        try:
+            payload_raw = self.rfile.read(length)
+        except Exception as exc:  # noqa: BLE001
+            self.send_json({"error": f"Unable to read request body: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        try:
+            payload = json.loads(payload_raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self.send_json({"error": f"Invalid JSON: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        date_values_input = payload.get("dateValues") or []
+        iso_dates_input = payload.get("isoDates") or []
+        start_filter = payload.get("start")
+        end_filter = payload.get("end")
+        print(
+            "[HTTP] POST /api/images-by-dates payload="
+            f"dateValues={date_values_input} isoDates={iso_dates_input} start={start_filter} end={end_filter}"
+        )
+
+        collected: List[int] = []
+        for value in date_values_input:
+            try:
+                collected.append(int(value))
+            except (ValueError, TypeError):
+                continue
+
+        for iso in iso_dates_input:
+            parsed = date_value_from_datetime(iso)
+            if parsed:
+                collected.append(parsed)
+
+        start_value = date_value_from_datetime(start_filter) if start_filter else None
+        end_value = date_value_from_datetime(end_filter) if end_filter else None
+
+        images = find_images_by_filters(
+            self.root_path,
+            self.image_repository,
+            hierarchy_provider=lambda: self.hierarchy_service.build(self.root_path),
+            date_values=collected,
+            start=start_value,
+            end=end_value,
+        )
+        print(f"[HTTP] /api/images-by-dates matched={len(images)}")
+        self.send_json({"images": images})
 
     def api_exif(self, params: Dict[str, List[str]]) -> None:
         relative_param = params.get("path", [""])[0]
         if not relative_param:
             raise ValueError("Missing image path")
         resolved_relative = unquote(relative_param)
-        target = resolve_relative_path(self.root_path, resolved_relative)
-        if not target.exists() or not target.is_file():
-            raise FileNotFoundError
-        normalized = str(target.relative_to(self.root_path)).replace(os.sep, "/")
+        normalized = resolved_relative.replace("\\", "/").lstrip("/")
         fields = get_exif_metadata(self.root_path, normalized)
         self.send_json({"path": normalized, "fields": fields})
 
     def api_groups(self, params: Dict[str, List[str]]) -> None:
         order = params.get("order", ["desc"])[0].lower()
-        if order not in {"asc", "desc"}:
-            order = "desc"
-        payload = groups_payload(self.root_path, order)
+        print(f"[HTTP] /api/groups order={order}")
+        payload = self.hierarchy_service.groups_payload(self.root_path, order)
         self.send_json(payload)
 
     def api_hierarchy(self, params: Dict[str, List[str]]) -> None:
         order = params.get("order", ["desc"])[0].lower()
-        if order not in {"asc", "desc"}:
-            order = "desc"
-        payload = hierarchy_payload(self.root_path, order)
+        print(f"[HTTP] /api/hierarchy order={order}")
+        payload = self.hierarchy_service.hierarchy_payload(self.root_path, order)
         self.send_json(payload)
 
     def api_group_images(self, params: Dict[str, List[str]]) -> None:
@@ -1847,9 +413,42 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             raise ValueError("Invalid limit") from exc
         limit = max(20, min(500, limit))
         order = params.get("order", ["desc"])[0].lower()
-        if order not in {"asc", "desc"}:
-            order = "desc"
-        payload = group_images_payload(self.root_path, group_key, cursor, limit, order)
+        payload = self.hierarchy_service.group_images_payload(
+            self.root_path,
+            group_key,
+            cursor,
+            limit,
+            order,
+        )
+        print(
+            f"[HTTP] /api/group-images group={group_key} cursor={cursor} order={order} limit={limit}"
+            f" count={len(payload.get('images', []))}"
+        )
+        self.send_json(payload)
+
+    def api_random_pool(self, params: Dict[str, List[str]]) -> None:
+        start = params.get("start", [None])[0]
+        end = params.get("end", [None])[0]
+        try:
+            limit_str = params.get("limit", [""])[0]
+            limit = int(limit_str) if limit_str else 500
+        except ValueError as exc:
+            raise ValueError("Invalid limit") from exc
+        limit = max(20, min(20_000, limit))
+        order = params.get("order", ["desc"])[0]
+        start_value = int(start) if start and str(start).isdigit() else None
+        end_value = int(end) if end and str(end).isdigit() else None
+        payload = self.hierarchy_service.random_pool_payload(
+            self.root_path,
+            start_value,
+            end_value,
+            order,
+            limit,
+        )
+        print(
+            f"[HTTP] /api/random-pool start={start_value} end={end_value} order={order} limit={limit}"
+            f" count={len(payload.get('images', []))}"
+        )
         self.send_json(payload)
 
     def api_timeline(self, params: Dict[str, List[str]]) -> None:
@@ -1861,13 +460,19 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             raise ValueError("Invalid limit") from exc
         limit = max(20, min(500, limit))
         order = params.get("order", ["desc"])[0]
-        order = order.lower()
-        if order not in {"asc", "desc"}:
-            order = "desc"
-        payload = timeline_sections(self.root_path, cursor, limit, order=order)
+        payload = self.hierarchy_service.timeline_sections(
+            self.root_path,
+            cursor,
+            limit,
+            order,
+        )
+        print(
+            f"[HTTP] /api/timeline cursor={cursor} order={order} limit={limit}"
+            f" count={len(payload.get('images', []))}"
+        )
         self.send_json(payload)
 
-    # Helpers
+    # Helpers ----------------------------------------------------------
     def serve_index(self) -> None:
         index_path = STATIC_DIR / "index.html"
         if not index_path.exists():
@@ -1937,15 +542,19 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             f"(default: {DEFAULT_MONGO_URI})."
         ),
     )
-    parser.add_argument(
-        "--mongo-db",
-        default=DEFAULT_MONGO_DB,
-        help=f"MongoDB database name (default: {DEFAULT_MONGO_DB}).",
-    )
+    parser.add_argument("--mongo-db", default=DEFAULT_MONGO_DB, help=f"MongoDB database name (default: {DEFAULT_MONGO_DB}).")
     parser.add_argument(
         "--mongo-collection",
         default=DEFAULT_MONGO_COLLECTION,
         help=f"MongoDB collection name (default: {DEFAULT_MONGO_COLLECTION}).",
+    )
+    parser.add_argument(
+        "--mongo-holiday-collection",
+        default=DEFAULT_MONGO_HOLIDAY_COLLECTION,
+        help=(
+            "MongoDB collection holding calendar/holiday documents (default: "
+            f"{DEFAULT_MONGO_HOLIDAY_COLLECTION})."
+        ),
     )
     parser.add_argument(
         "--no-mongo",
@@ -1955,63 +564,94 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def build_config(args: argparse.Namespace) -> AppConfig:
     root_path = args.root.expanduser().resolve()
-    if not root_path.exists():
-        raise FileNotFoundError(f"Image directory not found: {root_path}")
+    return AppConfig(
+        host=args.host,
+        port=args.port,
+        root=root_path,
+        thumbnail_size=THUMBNAIL_DEFAULT_SIZE,
+        mongo=None
+        if args.no_mongo or not args.mongo_uri.strip()
+        else MongoConfig(
+            uri=args.mongo_uri,
+            database=args.mongo_db,
+            image_collection=args.mongo_collection,
+            holiday_collection=args.mongo_holiday_collection,
+        ),
+    )
+
+
+def configure_mongo(config: AppConfig) -> Tuple[Optional["MongoClient"], Optional["Collection"], Optional["Collection"]]:
+    if config.mongo is None or MongoClient is None:
+        if config.mongo and MongoClient is None:
+            print("[WARN] pymongo not available; continuing without MongoDB support.")
+        return None, None, None
+
+    try:
+        client = MongoClient(
+            config.mongo.uri,
+            tz_aware=True,
+            serverSelectionTimeoutMS=5000,
+        )
+        client.admin.command("ping")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Failed to connect to MongoDB at {config.mongo.uri}: {exc}. Falling back to filesystem metadata.")
+        return None, None, None
+
+    image_collection = client[config.mongo.database][config.mongo.image_collection]
+    holiday_collection = client[config.mongo.database][config.mongo.holiday_collection]
+    print(
+        "Using MongoDB metadata from "
+        f"{image_collection.database.name}.{image_collection.name}"
+    )
+    return client, image_collection, holiday_collection
+
+
+def warm_cache(root: Path) -> None:
+    try:
+        HIERARCHY_SERVICE.sorted_image_paths(root)
+        HIERARCHY_SERVICE.build(root)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Failed to warm caches: {exc}")
+
+
+def main() -> None:
+    global APP_CONFIG, MONGO_CLIENT
+
+    args = parse_args()
+    config = build_config(args)
+    APP_CONFIG = config
+
+    if not config.root.exists():
+        raise FileNotFoundError(f"Image directory not found: {config.root}")
     if not STATIC_DIR.exists():
         raise FileNotFoundError(f"Static directory missing: {STATIC_DIR}")
 
+    client, image_collection, holiday_collection = configure_mongo(config)
+    MONGO_CLIENT = client
+    IMAGE_REPOSITORY.collection = image_collection
+    HOLIDAY_REPOSITORY.collection = holiday_collection
+
     handler_class = ImageRequestHandler
-    handler_class.root_path = root_path
+    handler_class.config = config
+    handler_class.image_repository = IMAGE_REPOSITORY
+    handler_class.holiday_repository = HOLIDAY_REPOSITORY
+    handler_class.hierarchy_service = HIERARCHY_SERVICE
 
-    collection: Optional["Collection"] = None
-    client = None
-    if args.no_mongo:
-        print("MongoDB integration disabled via --no-mongo; using filesystem metadata.")
-    elif MongoClient is None:
-        if args.mongo_uri:
-            print("[WARN] pymongo not available; continuing without MongoDB support.")
-    else:
-        mongo_uri = (args.mongo_uri or "").strip()
-        if not mongo_uri:
-            print("MongoDB URI empty; using filesystem metadata.")
-        else:
-            try:
-                client = MongoClient(
-                    mongo_uri,
-                    tz_aware=True,
-                    serverSelectionTimeoutMS=5000,
-                )
-                client.admin.command("ping")
-                collection = client[args.mongo_db][args.mongo_collection]
-                print(
-                    f"Using MongoDB metadata from {collection.database.name}.{collection.name}"
-                )
-            except Exception as exc:  # noqa: BLE001 - surface connection errors clearly
-                collection = None
-                print(
-                    f"[WARN] Failed to connect to MongoDB at {mongo_uri}: {exc}. "
-                    "Falling back to filesystem metadata."
-                )
+    warm_cache(config.root)
 
-    handler_class.mongo_client = client
-    handler_class.mongo_collection = collection
-    set_database_collection(collection)
-
-    print("Warming caches...")
-    warm_cache(root_path)
-
-    server = http.server.ThreadingHTTPServer((args.host, args.port), handler_class)
-    print(f"Serving images from {root_path}")
-    print(f"Open http://{args.host}:{args.port} in your browser")
+    server = http.server.ThreadingHTTPServer((config.host, config.port), handler_class)
+    print(f"Serving images from {config.root}")
+    print(f"Open http://{config.host}:{config.port} in your browser")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down server")
     finally:
         server.server_close()
+        if MONGO_CLIENT is not None:
+            MONGO_CLIENT.close()
 
 
 if __name__ == "__main__":

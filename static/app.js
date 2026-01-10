@@ -2,6 +2,7 @@ const INITIAL_PREFETCH_GROUPS = 2;
 const GROUP_BATCH_SIZE = 3;
 const SUBGROUP_BATCH_SIZE = 6;
 const THUMBNAILS_PER_GROUP = 20;
+const RANDOM_POOL_LIMIT = 2000;
 
 const urlParams = new URLSearchParams(window.location.search);
 const initialOrder = urlParams.get("order") === "asc" ? "asc" : "desc";
@@ -39,9 +40,13 @@ const MONTH_ABBREVIATIONS = [
   "Dec",
 ];
 
+const CONTROL_TABS = ["search", "year", "random"];
+
 const state = {
   order: initialOrder,
   orderVersion: 0,
+  activeControlTab: "search",
+  databaseMode: false,
   topGroups: [],
   topGroupIndex: 0,
   topGroupStatus: new Map(),
@@ -59,6 +64,7 @@ const state = {
   exifCache: new Map(),
   viewer: {
     open: false,
+    mode: null,
     groupKey: null,
     index: -1,
     pendingBlend: 0,
@@ -112,14 +118,18 @@ const elements = {
   viewerPrev: document.getElementById("viewerPrev"),
   viewerNext: document.getElementById("viewerNext"),
   viewerClose: document.getElementById("viewerClose"),
-  viewerDetailsToggle: document.getElementById("viewerDetailsToggle"),
   viewerDetailsPanel: document.getElementById("viewerDetailsPanel"),
-  viewerDetailsClose: document.getElementById("viewerDetailsClose"),
   viewerDetailsStatus: document.getElementById("viewerDetailsStatus"),
   viewerDetailsTable: document.getElementById("viewerDetailsTable"),
   viewerDetailsTableBody: document.getElementById("viewerDetailsTableBody"),
   header: document.getElementById("appHeader"),
   controlContent: document.getElementById("controlContent"),
+  controlTabButtons: Array.from(document.querySelectorAll(".control-tab")),
+  controlPanels: {
+    search: document.getElementById("controlPanelSearch"),
+    year: document.getElementById("controlPanelYear"),
+    random: document.getElementById("controlPanelRandom"),
+  },
   searchForm: document.getElementById("searchForm"),
   searchInput: document.getElementById("searchInput"),
   searchCombobox: document.getElementById("searchCombobox"),
@@ -166,6 +176,165 @@ function formatPhotoCount(count) {
   const value = Number.isFinite(count) ? Math.max(0, count) : 0;
   const formatted = value.toLocaleString();
   return `${formatted} photo${value === 1 ? "" : "s"}`;
+}
+
+const holidayDateCache = new Map();
+
+function getAvailableYears() {
+  const years = new Set();
+  if (Array.isArray(state.topGroups)) {
+    state.topGroups.forEach((topGroup) => {
+      if (typeof topGroup.dateValue === "number" && topGroup.dateValue > 0) {
+        years.add(Math.floor(topGroup.dateValue / 10000));
+      }
+      const subgroups = Array.isArray(topGroup.subgroups) ? topGroup.subgroups : [];
+      subgroups.forEach((subgroup) => {
+        if (typeof subgroup.dateValue === "number" && subgroup.dateValue > 0) {
+          years.add(Math.floor(subgroup.dateValue / 10000));
+        }
+      });
+    });
+  }
+  return years;
+}
+
+async function fetchHolidayDates(names) {
+  const prepared = Array.from(new Set((Array.isArray(names) ? names : [])
+    .map((name) => (typeof name === "string" ? name.trim() : ""))
+    .filter(Boolean)));
+  if (!prepared.length) {
+    return [];
+  }
+  const cacheKey = prepared.join("|").toLowerCase();
+  if (holidayDateCache.has(cacheKey)) {
+    return holidayDateCache.get(cacheKey);
+  }
+  const params = new URLSearchParams();
+  prepared.forEach((name) => params.append("name", name));
+  let response = { results: [] };
+  try {
+    response = await fetchJson(`/api/holiday-dates?${params.toString()}`);
+  } catch (error) {
+    console.error("Failed to resolve holiday dates", error);
+    holidayDateCache.set(cacheKey, []);
+    return [];
+  }
+  const availableYears = getAvailableYears();
+  const items = Array.isArray(response.results) ? response.results : [];
+  const aggregated = new Map();
+  items.forEach((item) => {
+    if (!item) {
+      return;
+    }
+    const value = Number.parseInt(item.dateValue, 10);
+    if (!Number.isFinite(value) || value <= 0) {
+      return;
+    }
+    const year = Math.floor(value / 10000);
+    if (availableYears.size && !availableYears.has(year)) {
+      return;
+    }
+    const iso = typeof item.iso === "string" && item.iso
+      ? item.iso
+      : formatValueToDateString(value);
+    if (!iso) {
+      return;
+    }
+    const isoLower = iso.toLowerCase();
+    const entry = aggregated.get(isoLower) || {
+      iso,
+      dateValue: value,
+      names: new Set(),
+      friendly: typeof item.friendly === "string" && item.friendly ? item.friendly : formatIsoDateFriendly(iso),
+    };
+    if (item.name) {
+      entry.names.add(String(item.name));
+    }
+    aggregated.set(isoLower, entry);
+  });
+
+  const resolved = Array.from(aggregated.values()).map((entry) => {
+    const names = Array.from(entry.names);
+    return {
+      iso: entry.iso,
+      dateValue: entry.dateValue,
+      name: names[0] || entry.iso,
+      names,
+      friendly: entry.friendly,
+    };
+  });
+  holidayDateCache.set(cacheKey, resolved);
+  return resolved;
+}
+
+async function fetchImagesByFilters({ dateEntries = [], startValue = null, endValue = null } = {}) {
+  const payload = {
+    dateValues: [],
+    isoDates: [],
+  };
+  dateEntries.forEach((entry) => {
+    if (!entry) {
+      return;
+    }
+    if (typeof entry.dateValue === "number" && entry.dateValue > 0) {
+      payload.dateValues.push(entry.dateValue);
+    } else if (entry.iso) {
+      payload.isoDates.push(entry.iso);
+    }
+  });
+  if (startValue) {
+    payload.start = formatValueToDateString(startValue);
+  }
+  if (endValue) {
+    payload.end = formatValueToDateString(endValue);
+  }
+
+  if (
+    !payload.dateValues.length &&
+    !payload.isoDates.length &&
+    !payload.start &&
+    !payload.end
+  ) {
+    return [];
+  }
+
+  const response = await fetch("/api/images-by-dates", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `Failed to fetch images by dates (${response.status})`);
+  }
+  const data = await response.json();
+  return Array.isArray(data.images) ? data.images : [];
+}
+
+function setActiveControlTab(tab) {
+  const target = CONTROL_TABS.includes(tab) ? tab : "search";
+  state.activeControlTab = target;
+  if (Array.isArray(elements.controlTabButtons)) {
+    elements.controlTabButtons.forEach((button) => {
+      const buttonTab = button.dataset.tab;
+      const isActive = buttonTab === target;
+      button.classList.toggle("active", isActive);
+      button.setAttribute("aria-selected", isActive ? "true" : "false");
+      button.setAttribute("tabindex", isActive ? "0" : "-1");
+    });
+  }
+  const panels = elements.controlPanels || {};
+  Object.entries(panels).forEach(([key, panel]) => {
+    if (panel) {
+      panel.hidden = key !== target;
+      panel.setAttribute("aria-hidden", key === target ? "false" : "true");
+    }
+  });
+  if (target !== "search") {
+    closeCombobox();
+  }
 }
 
 function normalizeSearchText(text) {
@@ -1014,6 +1183,7 @@ function createSpecificEntry(rawValue) {
       label: formatIsoDateFriendly(iso),
       text: iso.toLowerCase(),
       raw,
+      dateValue,
     };
   }
   const text = raw.toLowerCase();
@@ -1073,6 +1243,9 @@ function normalizeRandomViewerFilters() {
       if (entry.type === "date" && entry.iso) {
         entry.label = formatIsoDateFriendly(entry.iso);
         entry.text = entry.text || entry.iso.toLowerCase();
+        if (!entry.dateValue) {
+          entry.dateValue = parseDateToValue(entry.iso);
+        }
       } else if (entry.type === "year" && entry.year !== undefined) {
         entry.label = entry.label || `Year ${entry.year}`;
         entry.text = entry.text || String(entry.year).toLowerCase();
@@ -1162,6 +1335,93 @@ function setViewerNavDisabled(disabled) {
   }
 }
 
+function displayRandomViewerImage(choice) {
+  if (!choice || !choice.path) {
+    return;
+  }
+  const blendDuration = Math.max(0, Number(state.viewer.pendingBlend) || 0);
+  state.viewer.pendingBlend = 0;
+  state.viewer.open = true;
+  state.viewer.mode = "random";
+  state.viewer.groupKey = null;
+  state.viewer.index = -1;
+  state.viewer.detailsPath = choice.path;
+  elements.viewerOverlay.hidden = false;
+  document.body.classList.add("viewer-open");
+  if (elements.header) {
+    elements.header.classList.add("viewer-hidden");
+  }
+  prepareViewerTransition(blendDuration);
+  showViewerLoading(blendDuration);
+  setViewerNavDisabled(true);
+  updateUrlWithImage(choice.path);
+
+  const item = {
+    path: choice.path,
+    name: choice.name || (choice.path.split("/").pop() || choice.path),
+    dateHint: choice.isoValue || choice.dateHint || "",
+  };
+
+  updateViewerDetails(item);
+
+  const mainImage = elements.viewerImage;
+  const overlayImage = elements.viewerImageOverlay;
+  const finalize = () => {
+    updateViewerMetadata(null, item);
+    highlightActiveThumbnail(null);
+    if (mainImage) {
+      if (blendDuration > 0 && overlayImage && overlayImage.src) {
+        overlayImage.style.transition = `opacity ${blendDuration}s ease`;
+        overlayImage.hidden = false;
+        requestAnimationFrame(() => {
+          mainImage.style.opacity = "1";
+          overlayImage.style.opacity = "0";
+        });
+        setTimeout(() => {
+          overlayImage.style.transition = "";
+          overlayImage.style.opacity = "0";
+          overlayImage.hidden = true;
+          mainImage.style.transition = "";
+        }, blendDuration * 1000 + 60);
+      } else {
+        requestAnimationFrame(() => {
+          mainImage.style.opacity = "1";
+        });
+        if (overlayImage) {
+          overlayImage.style.opacity = "0";
+          overlayImage.hidden = true;
+        }
+        mainImage.style.transition = "";
+      }
+      mainImage.removeEventListener("load", finalize);
+      mainImage.removeEventListener("error", handleError);
+    }
+  };
+  const handleError = () => {
+    setInfoBar(elements.viewerInfoTop, "Failed to load image", "block");
+    setInfoBar(elements.viewerInfoBottom, item.name || "", item.name ? "block" : "none");
+    setInfoBar(elements.viewerInfoLeft, "", "block");
+    setInfoBar(elements.viewerInfoRight, "", "block");
+    updateViewerDetails(null);
+    if (overlayImage) {
+      overlayImage.style.opacity = "0";
+      overlayImage.hidden = true;
+    }
+    if (mainImage) {
+      mainImage.style.opacity = "1";
+      mainImage.removeEventListener("load", finalize);
+      mainImage.removeEventListener("error", handleError);
+    }
+  };
+
+  if (mainImage) {
+    mainImage.addEventListener("load", finalize);
+    mainImage.addEventListener("error", handleError);
+    mainImage.src = `/api/image?path=${encodeURIComponent(choice.path)}`;
+    mainImage.alt = item.name || "";
+  }
+}
+
 function stopRandomViewer({ resetToggle = true } = {}) {
   clearRandomViewerTimer();
   state.randomViewer.running = false;
@@ -1169,12 +1429,13 @@ function stopRandomViewer({ resetToggle = true } = {}) {
   state.randomViewer.lastPath = null;
   state.randomViewer.pool = [];
   state.randomViewer.queue = [];
-  state.randomViewer.queue = [];
   state.randomViewer.nextChoice = null;
   if (resetToggle && elements.randomViewerToggle) {
     elements.randomViewerToggle.checked = false;
   }
-  setViewerNavDisabled(false);
+  if (state.viewer.mode === "group") {
+    setViewerNavDisabled(false);
+  }
   state.viewer.pendingBlend = 0;
   if (elements.viewerImageOverlay) {
     elements.viewerImageOverlay.style.opacity = "0";
@@ -1205,105 +1466,160 @@ async function buildRandomViewerPool() {
   const specificEntries = filter.specificList || [];
   const hasSpecific = specificEntries.length > 0;
   const hasRange = filter.start !== null || filter.end !== null;
-  const pool = [];
-  const topGroupMap = new Map();
-  const subgroupMap = new Map();
-  state.topGroups.forEach((topGroup) => {
-    topGroupMap.set(topGroup.key, topGroup);
-    const subgroups = Array.isArray(topGroup.subgroups) ? topGroup.subgroups : [];
-    subgroups.forEach((subgroup) => {
-      subgroupMap.set(subgroup.key, subgroup);
-    });
-  });
 
-  for (const [groupKey, subgroupMeta] of subgroupMap.entries()) {
-    ensureSubgroupRendered(groupKey);
-    const groupState = state.groups.get(groupKey);
-    if (!groupState) {
-      continue;
+  const mapToPoolEntry = (item) => {
+    if (!item || !item.path) {
+      return null;
     }
-    await ensureGroupManifestCount(groupState, groupState.total);
-    const manifest = Array.isArray(groupState.manifest) ? groupState.manifest : [];
-    const subgroupLabel = subgroupMeta ? (subgroupMeta.formattedLabel || subgroupMeta.label || "") : "";
-    const topKey = groupKey.split("/")[0] || groupKey;
-    const topGroup = topGroupMap.get(topKey);
-    const topLabelText = topGroup ? (topGroup.formattedLabel || topGroup.label || "") : "";
+    const fallbackName = item.path.split("/").pop() || item.path;
+    let dateValue = Number.isFinite(item.dateValue) ? Number(item.dateValue) : null;
+    if (!dateValue && item.iso) {
+      dateValue = parseDateToValue(item.iso);
+    }
+    if (!dateValue && item.dateHint) {
+      dateValue = parseDateToValue(item.dateHint);
+    }
+    const isoValue = item.iso || (dateValue ? formatValueToDateString(dateValue) : null);
+    return {
+      path: item.path,
+      name: item.name || fallbackName,
+      dateValue: Number.isFinite(dateValue) ? dateValue : null,
+      isoValue,
+      dateHint: item.dateHint || isoValue || null,
+      groupKey: item.groupKey || deriveGroupKey(item.path),
+    };
+  };
 
-    manifest.forEach((item) => {
-      let dateValue = Number.isInteger(item.dateValue) ? item.dateValue : null;
-      if (!dateValue) {
-        dateValue = deriveDateValueFromItem(item);
-        if (dateValue) {
-          item.dateValue = dateValue;
-        }
-      }
-      const isoValue = dateValue ? formatValueToDateString(dateValue) : null;
-      const matchesSpecific = hasSpecific
-        ? specificEntries.some((entry) => {
-            if (entry.type === "date") {
-              return isoValue && isoValue === entry.iso;
-            }
-            if (entry.type === "year") {
-              return dateValue && Math.floor(dateValue / 10000) === entry.year;
-            }
-            if (entry.type === "text") {
-              const target = entry.text;
-              if (!target) {
-                return false;
-              }
-              const lowerTarget = target.toLowerCase();
-              if (isoValue && isoValue.toLowerCase().includes(lowerTarget)) {
-                return true;
-              }
-              if (item.path && item.path.toLowerCase().includes(lowerTarget)) {
-                return true;
-              }
-              if (groupKey && groupKey.toLowerCase().includes(lowerTarget)) {
-                return true;
-              }
-              if (item.name && item.name.toLowerCase().includes(lowerTarget)) {
-                return true;
-              }
-              if (subgroupLabel && subgroupLabel.toLowerCase().includes(lowerTarget)) {
-                return true;
-              }
-              if (topLabelText && topLabelText.toLowerCase().includes(lowerTarget)) {
-                return true;
-              }
-              const topGroupMatch = topGroupMap.get(topKey);
-              if (topGroupMatch) {
-                const topLabel = (topGroupMatch.formattedLabel || topGroupMatch.label || "").toLowerCase();
-                if (topLabel.includes(lowerTarget)) {
-                  return true;
-                }
-              }
-              return false;
-            }
+  const collectFromFilters = async () => {
+    try {
+      const images = await fetchImagesByFilters({
+        dateEntries: specificEntries,
+        startValue: filter.start,
+        endValue: filter.end,
+      });
+      const seen = new Set();
+      return images
+        .map(mapToPoolEntry)
+        .filter((entry) => {
+          if (!entry || !entry.path) {
             return false;
-          })
-        : false;
-      let matchesRange = true;
-      if (hasRange) {
-        if (dateValue === null) {
-          matchesRange = false;
-        } else {
-          if (filter.start !== null && dateValue < filter.start) {
-            matchesRange = false;
           }
-          if (filter.end !== null && dateValue > filter.end) {
-            matchesRange = false;
+          if (seen.has(entry.path)) {
+            return false;
           }
-        }
+          seen.add(entry.path);
+          if (!hasRange) {
+            return true;
+          }
+          if (filter.start !== null && entry.dateValue !== null && entry.dateValue < filter.start) {
+            return false;
+          }
+          if (filter.end !== null && entry.dateValue !== null && entry.dateValue > filter.end) {
+            return false;
+          }
+          return true;
+        });
+    } catch (error) {
+      console.error("Failed to fetch images by filters", error);
+      return [];
+    }
+  };
+
+  const collectFromRandomPool = async () => {
+    try {
+      const params = new URLSearchParams({
+        order: state.order,
+        limit: String(RANDOM_POOL_LIMIT),
+      });
+      if (filter.start !== null) {
+        params.set("start", String(filter.start));
       }
-      const include = hasSpecific
-        ? matchesSpecific || (hasRange ? matchesRange : false)
-        : hasRange
-        ? matchesRange
-        : true;
-      if (!include || !item.path) {
-        return;
+      if (filter.end !== null) {
+        params.set("end", String(filter.end));
       }
-      pool.push({ path: item.path, groupKey, dateValue, isoValue });
+      const data = await fetchJson(`/api/random-pool?${params.toString()}`);
+      const images = Array.isArray(data.images) ? data.images : [];
+      const seen = new Set();
+      return images
+        .map(mapToPoolEntry)
+        .filter((entry) => {
+          if (!entry || !entry.path) {
+            return false;
+          }
+          if (seen.has(entry.path)) {
+            return false;
+          }
+          seen.add(entry.path);
+          return true;
+        });
+    } catch (error) {
+      console.error("Failed to fetch random image pool", error);
+      return [];
+    }
+  };
+
+  let pool = [];
+  if (hasSpecific || hasRange) {
+    pool = await collectFromFilters();
+  }
+  if (!pool.length) {
+    pool = await collectFromRandomPool();
+  }
+
+  const matchesRange = (entry) => {
+    if (!entry || entry.dateValue === null) {
+      return false;
+    }
+    if (filter.start !== null && entry.dateValue < filter.start) {
+      return false;
+    }
+    if (filter.end !== null && entry.dateValue > filter.end) {
+      return false;
+    }
+    return true;
+  };
+
+  const matchesSpecificEntry = (entry, spec) => {
+    if (!entry || !spec) {
+      return false;
+    }
+    if (spec.type === "date" && spec.iso) {
+      const isoLower = spec.iso.toLowerCase();
+      const entryIso = entry.isoValue ? entry.isoValue.toLowerCase() : "";
+      return entryIso === isoLower;
+    }
+    if (spec.type === "year" && Number.isFinite(spec.year)) {
+      if (!Number.isFinite(entry.dateValue)) {
+        return false;
+      }
+      return Math.floor(entry.dateValue / 10000) === Number(spec.year);
+    }
+    if (spec.type === "text") {
+      const needle = (spec.text || "").toLowerCase();
+      if (!needle) {
+        return false;
+      }
+      const haystacks = [
+        entry.name,
+        entry.path,
+        entry.isoValue,
+        entry.dateHint,
+      ]
+        .filter(Boolean)
+        .map((value) => String(value).toLowerCase());
+      return haystacks.some((value) => value.includes(needle));
+    }
+    return false;
+  };
+
+  if (pool.length && (hasSpecific || hasRange)) {
+    pool = pool.filter((entry) => {
+      const inRange = !hasRange || matchesRange(entry);
+      if (!hasSpecific) {
+        return inRange;
+      }
+      const specificMatch = specificEntries.some((spec) => matchesSpecificEntry(entry, spec));
+      return specificMatch || (hasRange ? inRange : false);
     });
   }
 
@@ -1364,7 +1680,7 @@ function drawNextRandomEntry(excludePath = null) {
   if (!entry) {
     return null;
   }
-  return { path: entry.path, groupKey: entry.groupKey };
+  return { ...entry };
 }
 
 function preloadRandomChoice(excludePath = null) {
@@ -1426,7 +1742,7 @@ async function runRandomViewerCycle() {
   }
   try {
     state.viewer.pendingBlend = state.randomViewer.blend;
-    await openImageByPath(choice.path);
+    displayRandomViewerImage(choice);
     state.randomViewer.lastPath = choice.path;
   } catch (error) {
     console.error("Random viewer failed to open image", error);
@@ -1607,13 +1923,62 @@ async function addRandomViewerSpecificDate() {
     alert("Please enter a valid value (date, year, or text).");
     return;
   }
+  let entriesToAdd = [entry];
+  if (entry.type === "text") {
+    try {
+      const holidayMatches = await fetchHolidayDates([entry.raw || entry.text || raw]);
+      if (holidayMatches.length) {
+        const unique = new Map();
+        holidayMatches.forEach((match) => {
+          if (!match || !match.iso) {
+            return;
+          }
+          const iso = match.iso;
+          const isoLower = iso.toLowerCase();
+          if (!unique.has(isoLower)) {
+            const labelName = Array.isArray(match.names) && match.names.length
+              ? match.names[0]
+              : match.name || raw;
+            const friendly = match.friendly || formatIsoDateFriendly(iso);
+            unique.set(isoLower, {
+              key: `date:${iso}`,
+              type: "date",
+              iso,
+              dateValue: match.dateValue || parseDateToValue(iso),
+              label: labelName ? `${labelName} (${friendly})` : friendly,
+              text: isoLower,
+              raw: labelName || friendly,
+              holidayNames: Array.isArray(match.names) && match.names.length ? match.names : (match.name ? [match.name] : []),
+            });
+          }
+        });
+        const expanded = Array.from(unique.values());
+        if (expanded.length) {
+          entriesToAdd = expanded;
+        }
+      }
+    } catch (error) {
+      console.error("Failed to expand holiday name", error);
+    }
+  }
+
   const filter = normalizeRandomViewerFilters();
-  if (filter.specificMap.has(entry.key)) {
+  let added = false;
+  entriesToAdd.forEach((item) => {
+    if (!item || !item.key) {
+      return;
+    }
+    if (filter.specificMap.has(item.key)) {
+      return;
+    }
+    filter.specificMap.set(item.key, item);
+    filter.specificList.push(item);
+    added = true;
+  });
+  if (!added) {
     input.value = "";
     return;
   }
-  filter.specificMap.set(entry.key, entry);
-  filter.specificList.push(entry);
   filter.specificList.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
   input.value = "";
   renderRandomViewerChips();
@@ -1813,7 +2178,16 @@ function resetStateForOrder() {
     activeIndex: -1,
     filtered: [],
   };
-  state.viewer = { open: false, groupKey: null, index: -1, pendingBlend: 0 };
+  state.viewer = {
+    open: false,
+    groupKey: null,
+    index: -1,
+    pendingBlend: 0,
+    detailsOpen: false,
+    detailsPath: null,
+    detailsLoading: false,
+    detailsRequestToken: null,
+  };
   state.randomViewer.filter = {
     start: null,
     end: null,
@@ -1834,6 +2208,7 @@ function resetStateForOrder() {
   if (elements.yearNavigation) {
     elements.yearNavigation.hidden = true;
   }
+  setActiveControlTab(state.activeControlTab);
   renderRandomViewerChips();
   updateRandomViewerSettingsAvailability();
   if (elements.searchCombobox) {
@@ -1858,6 +2233,7 @@ async function fetchHierarchy() {
   try {
     const data = await fetchJson(`/api/groups?order=${state.order}`);
     resetStateForOrder();
+    state.databaseMode = Boolean(data.database);
     state.topGroups = Array.isArray(data.groups) ? data.groups : [];
     buildTopGroupOptions(state.topGroups);
     renderNextTopGroups(GROUP_BATCH_SIZE);
@@ -2479,8 +2855,18 @@ async function ensureImageLoaded(path, groupKey) {
   if (!groupState) {
     return -1;
   }
-  const manifest = groupState.manifest || state.imagesByGroup.get(groupKey) || [];
-  const targetIndex = manifest.findIndex((item) => item && item.path === path);
+  let manifest = groupState.manifest || state.imagesByGroup.get(groupKey) || [];
+  let targetIndex = manifest.findIndex((item) => item && item.path === path);
+  while (targetIndex === -1 && !groupState.fullyLoaded) {
+    const previousLength = manifest.length;
+    const nextTarget = previousLength + THUMBNAILS_PER_GROUP;
+    await ensureGroupManifestCount(groupState, nextTarget);
+    manifest = groupState.manifest || state.imagesByGroup.get(groupKey) || [];
+    targetIndex = manifest.findIndex((item) => item && item.path === path);
+    if (manifest.length === previousLength) {
+      break;
+    }
+  }
   if (targetIndex === -1) {
     return -1;
   }
@@ -2525,6 +2911,7 @@ function openViewerAt(groupKey, index) {
     return;
   }
   state.viewer.open = true;
+  state.viewer.mode = "group";
   state.viewer.groupKey = groupKey;
   state.viewer.index = index;
   elements.viewerOverlay.hidden = false;
@@ -2540,6 +2927,7 @@ function openViewerAt(groupKey, index) {
 
 function closeViewer() {
   state.viewer.open = false;
+  state.viewer.mode = null;
   state.viewer.groupKey = null;
   state.viewer.index = -1;
   state.viewer.detailsPath = null;
@@ -2561,10 +2949,14 @@ function closeViewer() {
     state.activeThumb = null;
   }
   showViewerLoading();
+  setViewerNavDisabled(false);
 }
 
 function renderViewer() {
   if (!state.viewer.open) {
+    return;
+  }
+  if (state.viewer.mode !== "group") {
     return;
   }
   const groupState = state.groups.get(state.viewer.groupKey);
@@ -2802,10 +3194,6 @@ function updateViewerDetails(item) {
 
 function setViewerDetailsVisibility(open) {
   state.viewer.detailsOpen = Boolean(open);
-  if (elements.viewerDetailsToggle) {
-    elements.viewerDetailsToggle.setAttribute("aria-expanded", state.viewer.detailsOpen ? "true" : "false");
-    elements.viewerDetailsToggle.textContent = state.viewer.detailsOpen ? "Hide details" : "Show details";
-  }
   if (elements.viewerDetailsPanel) {
     elements.viewerDetailsPanel.hidden = !state.viewer.detailsOpen;
   }
@@ -2818,8 +3206,24 @@ function setViewerDetailsVisibility(open) {
   updateViewerDetails({ path: state.viewer.detailsPath });
 }
 
-function toggleViewerDetails() {
-  setViewerDetailsVisibility(!state.viewer.detailsOpen);
+function handleViewerDoubleClick(event) {
+  if (!state.viewer.open) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  setViewerDetailsVisibility(true);
+}
+
+function handleViewerContainerClick(event) {
+  if (!state.viewer.detailsOpen) {
+    return;
+  }
+  const panel = elements.viewerDetailsPanel;
+  if (panel && panel.contains(event.target)) {
+    return;
+  }
+  setViewerDetailsVisibility(false);
 }
 
 function showViewerLoading(blendDuration = 0) {
@@ -2883,6 +3287,9 @@ async function showNext() {
   if (!state.viewer.open) {
     return;
   }
+  if (state.viewer.mode !== "group") {
+    return;
+  }
   const currentGroup = state.groups.get(state.viewer.groupKey);
   if (!currentGroup) {
     return;
@@ -2928,6 +3335,9 @@ async function showNext() {
 
 async function showPrevious() {
   if (!state.viewer.open) {
+    return;
+  }
+  if (state.viewer.mode !== "group") {
     return;
   }
   const currentGroup = state.groups.get(state.viewer.groupKey);
@@ -3041,17 +3451,55 @@ function preloadInitialGroups() {
   scheduleViewportLoading();
 }
 
-function handleSearch(event) {
+async function handleSearch(event) {
   event.preventDefault();
   openControlPanel();
   closeCombobox();
-  const rawQuery = elements.searchInput.value || "";
+  const rawQuery = (elements.searchInput.value || "").trim();
   const normalizedQuery = normalizeSearchText(rawQuery);
   const tokens = normalizedQuery ? normalizedQuery.split(" ").filter(Boolean) : [];
   if (!tokens.length) {
     closeControlPanel();
     return;
   }
+  const holidayTerms = [];
+  if (rawQuery) {
+    holidayTerms.push(rawQuery);
+  }
+  if (normalizedQuery && normalizedQuery !== rawQuery) {
+    holidayTerms.push(normalizedQuery);
+  }
+  if (tokens.length > 1) {
+    const joined = tokens.join(" ");
+    if (!holidayTerms.includes(joined)) {
+      holidayTerms.push(joined);
+    }
+  }
+  tokens.forEach((token) => {
+    if (token && !holidayTerms.includes(token)) {
+      holidayTerms.push(token);
+    }
+  });
+
+  let holidayMatches = [];
+  try {
+    holidayMatches = await fetchHolidayDates(holidayTerms);
+  } catch (error) {
+    console.error("Unable to resolve holiday dates", error);
+  }
+
+  const holidayIsoMap = new Map();
+  holidayMatches.forEach((item) => {
+    if (!item || !item.iso) {
+      return;
+    }
+    const isoLower = item.iso.toLowerCase();
+    const names = Array.isArray(item.names) && item.names.length ? item.names : (item.name ? [item.name] : []);
+    const existing = holidayIsoMap.get(isoLower) || new Set();
+    names.forEach((name) => existing.add(name));
+    holidayIsoMap.set(isoLower, existing);
+  });
+
   const matches = [];
   state.topGroups.forEach((topGroup) => {
     const subgroups = Array.isArray(topGroup.subgroups) ? topGroup.subgroups : [];
@@ -3060,23 +3508,46 @@ function handleSearch(event) {
       if (!haystack) {
         return;
       }
+      const subgroupDateValue = typeof subgroup.dateValue === "number" && subgroup.dateValue > 0 ? subgroup.dateValue : null;
+      const subgroupIsoLower = subgroupDateValue ? formatValueToDateString(subgroupDateValue).toLowerCase() : null;
+      const holidayNames = new Set();
+      if (subgroupIsoLower && holidayIsoMap.has(subgroupIsoLower)) {
+        holidayIsoMap.get(subgroupIsoLower).forEach((name) => holidayNames.add(name));
+      }
+      const manifest = state.imagesByGroup.get(subgroup.key) || [];
+      if (!holidayNames.size && holidayIsoMap.size && Array.isArray(manifest)) {
+        manifest.forEach((item) => {
+          if (item && typeof item.dateValue === "number" && item.dateValue > 0) {
+            const isoLower = formatValueToDateString(item.dateValue).toLowerCase();
+            if (holidayIsoMap.has(isoLower)) {
+              holidayIsoMap.get(isoLower).forEach((name) => holidayNames.add(name));
+            }
+          }
+        });
+      }
+
+      const matchesHoliday = holidayNames.size > 0;
       const matchesQuery = tokens.every((token) => haystack.includes(token));
-      if (!matchesQuery) {
+      if (!matchesQuery && !matchesHoliday) {
         return;
       }
       const topLabel = topGroup.formattedLabel || topGroup.label;
       const subgroupLabel = subgroup.formattedLabel || subgroup.label;
       const location = typeof subgroup.location === "string" ? subgroup.location : "";
-      const manifest = state.imagesByGroup.get(subgroup.key) || [];
-      const count = manifest.length || subgroup.count || 0;
-      matches.push({
+      const manifestItems = state.imagesByGroup.get(subgroup.key) || manifest;
+      const count = (manifestItems ? manifestItems.length : manifest.length) || subgroup.count || 0;
+      const match = {
         key: subgroup.key,
         topLabel,
         label: subgroup.label,
         displayLabel: subgroupLabel,
         location,
         count,
-      });
+      };
+      if (matchesHoliday) {
+        match.holidayNames = Array.from(holidayNames).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+      }
+      matches.push(match);
     });
   });
   renderSearchResults(matches);
@@ -3102,6 +3573,9 @@ function renderSearchResults(results) {
     const parts = [`${match.topLabel} / ${label}`, formatPhotoCount(match.count)];
     if (match.location) {
       parts.push(match.location);
+    }
+    if (Array.isArray(match.holidayNames) && match.holidayNames.length) {
+      parts.push(`Holiday: ${match.holidayNames.join(", ")}`);
     }
     item.textContent = parts.join(" • ");
     elements.searchResults.appendChild(item);
@@ -3133,7 +3607,11 @@ elements.searchResults.addEventListener("click", async (event) => {
   closeControlPanel();
 });
 
-elements.searchForm.addEventListener("submit", handleSearch);
+if (elements.searchForm) {
+  elements.searchForm.addEventListener("submit", (event) => {
+    handleSearch(event).catch((error) => console.error("Search failed", error));
+  });
+}
 
 if (elements.searchInput) {
   elements.searchInput.addEventListener("focus", handleSearchInputFocus);
@@ -3217,14 +3695,17 @@ if (elements.randomViewerEnd) {
 }
 
 if (elements.randomViewerAddDate) {
-  elements.randomViewerAddDate.addEventListener("click", addRandomViewerSpecificDate);
+  elements.randomViewerAddDate.addEventListener("click", (event) => {
+    event.preventDefault();
+    addRandomViewerSpecificDate().catch((error) => console.error("Failed to add specific date", error));
+  });
 }
 
 if (elements.randomViewerSpecificInput) {
   elements.randomViewerSpecificInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
-      addRandomViewerSpecificDate();
+      addRandomViewerSpecificDate().catch((error) => console.error("Failed to add specific date", error));
     }
   });
 }
@@ -3264,18 +3745,32 @@ if (elements.orderSwitch) {
   });
 }
 
-if (elements.viewerDetailsToggle) {
-  elements.viewerDetailsToggle.addEventListener("click", (event) => {
-    event.preventDefault();
-    toggleViewerDetails();
+if (Array.isArray(elements.controlTabButtons) && elements.controlTabButtons.length) {
+  elements.controlTabButtons.forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      const tab = button.dataset.tab;
+      setActiveControlTab(tab);
+    });
   });
 }
 
-if (elements.viewerDetailsClose) {
-  elements.viewerDetailsClose.addEventListener("click", (event) => {
-    event.preventDefault();
-    setViewerDetailsVisibility(false);
+if (elements.viewerDetailsPanel) {
+  elements.viewerDetailsPanel.addEventListener("click", (event) => {
+    event.stopPropagation();
   });
+}
+
+if (elements.viewerImage) {
+  elements.viewerImage.addEventListener("dblclick", handleViewerDoubleClick);
+}
+
+if (elements.viewerImageOverlay) {
+  elements.viewerImageOverlay.addEventListener("dblclick", handleViewerDoubleClick);
+}
+
+if (elements.viewerContainer) {
+  elements.viewerContainer.addEventListener("click", handleViewerContainerClick);
 }
 
 elements.viewerClose.addEventListener("click", (event) => {
@@ -3500,6 +3995,7 @@ updateDownloadControls();
 updateRandomViewerSettingsAvailability();
 renderRandomViewerChips();
 updateFlyoutPinUI();
+setActiveControlTab(state.activeControlTab);
 
 setupViewerGestures();
 

@@ -71,9 +71,8 @@ body.viewer-open {
   top: -120px;
   left: 0;
   right: 0;
-  background: linear-gradient(135deg, rgba(17, 24, 39, 0.96), rgba(30, 64, 175, 0.65));
+  background: #1e3a8a;
   border-bottom: 1px solid rgba(96, 165, 250, 0.25);
-  backdrop-filter: blur(12px);
   box-shadow: 0 20px 45px rgba(15, 23, 42, 0.55);
   padding: 12px 18px;
   transition: top 0.25s ease, padding 0.25s ease, box-shadow 0.25s ease;
@@ -103,6 +102,12 @@ body.viewer-open {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
+}
+
+.header-controls {
+  display: inline-flex;
+  align-items: center;
   gap: 16px;
 }
 
@@ -168,6 +173,67 @@ body.viewer-open {
   max-height: 0;
   opacity: 0;
   transition: max-height 0.35s ease, opacity 0.25s ease;
+}
+
+.control-tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  border-bottom: 1px solid rgba(59, 130, 246, 0.35);
+  padding: 0;
+  margin-bottom: 14px;
+}
+
+.control-tab {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 10px 18px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+  background: rgba(30, 58, 138, 0.35);
+  color: #e2e8f0;
+  font-size: 0.92rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.control-tab:hover,
+.control-tab:focus-visible {
+  background: rgba(59, 130, 246, 0.35);
+  border-color: rgba(191, 219, 254, 0.4);
+  color: #f8fafc;
+  outline: none;
+}
+
+.control-tab.active {
+  background: rgba(37, 99, 235, 0.92);
+  border-color: rgba(191, 219, 254, 0.65);
+  color: #f8fafc;
+  box-shadow: 0 -2px 12px rgba(15, 23, 42, 0.35);
+}
+
+.control-tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 3px;
+  background: rgba(191, 219, 254, 0.9);
+  border-radius: 999px;
+}
+
+.control-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.control-panel[hidden] {
+  display: none;
 }
 
 .app-header.expanded .control-content {
@@ -495,13 +561,12 @@ body.viewer-open {
 .random-viewer {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 18px;
   padding: 18px 16px 20px;
   border-radius: 18px;
   border: 1px solid rgba(71, 85, 105, 0.45);
   background: rgba(15, 23, 42, 0.45);
-  width: min(100%, 520px);
-  align-self: flex-start;
+  width: 100%;
 }
 
 .random-viewer.random-viewer-active {
@@ -511,8 +576,10 @@ body.viewer-open {
 
 .random-viewer-header {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .random-viewer-toggle {
@@ -580,15 +647,16 @@ body.viewer-open {
 }
 
 .random-viewer-help {
+  flex: 1 1 240px;
   margin: 0;
   font-size: 0.85rem;
   color: rgba(148, 163, 184, 0.8);
 }
 
 .random-viewer-settings {
-  display: flex;
-  flex-direction: column;
+  display: grid;
   gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   transition: opacity 0.2s ease;
   width: 100%;
 }
@@ -596,7 +664,12 @@ body.viewer-open {
 .random-setting {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
+  padding: 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  background: rgba(15, 23, 42, 0.55);
+  min-height: 100%;
 }
 
 .random-setting label,
@@ -617,16 +690,10 @@ body.viewer-open {
   width: 100%;
 }
 
-.random-setting input[type="number"] {
-  max-width: 160px;
-}
-
-.random-setting input[type="date"] {
-  max-width: 220px;
-}
-
+.random-setting input[type="number"],
+.random-setting input[type="date"],
 .random-setting input[type="text"] {
-  max-width: 260px;
+  max-width: none;
 }
 
 .random-setting input[type="number"]:focus,
@@ -639,8 +706,9 @@ body.viewer-open {
 .random-setting fieldset {
   border: 1px solid rgba(71, 85, 105, 0.5);
   border-radius: 12px;
-  padding: 10px 12px 14px;
+  padding: 12px 14px 16px;
   width: 100%;
+  height: 100%;
 }
 
 .date-range-inputs {
@@ -660,7 +728,7 @@ body.viewer-open {
 .specific-date-input input[type="text"] {
   flex: 1 1 200px;
   min-width: 180px;
-  max-width: 260px;
+  max-width: none;
 }
 
 .specific-date-input button {
@@ -687,6 +755,18 @@ body.viewer-open {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 8px;
+}
+
+.random-setting.random-dates,
+.random-setting.random-specific-dates {
+  grid-column: span 2;
+}
+
+@media (max-width: 720px) {
+  .random-setting.random-dates,
+  .random-setting.random-specific-dates {
+    grid-column: span 1;
+  }
 }
 
 .date-chip {
@@ -1343,32 +1423,6 @@ body.viewer-open {
   background: rgba(37, 99, 235, 0.55);
 }
 
-.viewer-details-toggle {
-  position: absolute;
-  bottom: calc(24px + env(safe-area-inset-bottom));
-  right: calc(24px + env(safe-area-inset-right));
-  background: rgba(15, 23, 42, 0.75);
-  color: rgba(226, 232, 240, 0.95);
-  border: 1px solid rgba(148, 163, 184, 0.5);
-  border-radius: 999px;
-  padding: 10px 18px;
-  font-size: 0.95rem;
-  cursor: pointer;
-  z-index: 100;
-  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.55);
-  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
-  transform: translate3d(0, 0, 0);
-}
-
-.viewer-details-toggle:hover,
-.viewer-details-toggle:focus-visible {
-  background: rgba(37, 99, 235, 0.75);
-  border-color: rgba(148, 163, 184, 0.8);
-  color: #fff;
-  transform: translate3d(0, -1px, 0);
-  outline: none;
-}
-
 .viewer-details-panel {
   position: absolute;
   top: calc(88px + env(safe-area-inset-top));
@@ -1404,29 +1458,6 @@ body.viewer-open {
   margin: 0;
   font-size: 1.1rem;
   font-weight: 600;
-}
-
-.viewer-details-close {
-  flex: 0 0 auto;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  border: 1px solid rgba(148, 163, 184, 0.4);
-  background: rgba(37, 99, 235, 0.7);
-  color: #f8fafc;
-  font-size: 1.1rem;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.2s ease, border-color 0.2s ease;
-}
-
-.viewer-details-close:hover,
-.viewer-details-close:focus-visible {
-  background: rgba(37, 99, 235, 0.9);
-  border-color: rgba(148, 163, 184, 0.7);
-  outline: none;
 }
 
 .viewer-details-content {
@@ -1498,17 +1529,6 @@ body.viewer-open {
     right: auto;
     transform: translate3d(-50%, 0, 0);
     max-height: calc(100vh - 150px);
-  }
-
-  .viewer-details-toggle {
-    left: 50%;
-    right: auto;
-    transform: translate3d(-50%, 0, 0);
-  }
-
-  .viewer-details-toggle:hover,
-  .viewer-details-toggle:focus-visible {
-    transform: translate3d(-50%, -1px, 0);
   }
 }
 
