@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 
 from PIL import Image, ImageOps
 
-from .config import THUMBNAIL_CACHE_DIR
+from config import THUMBNAIL_CACHE_DIR
 
 
 def extract_exif_thumbnail(image_path: Path) -> Optional[bytes]:

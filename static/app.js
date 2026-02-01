@@ -61,7 +61,7 @@ const state = {
   groupIndexMap: new Map(),
   imagesByGroup: new Map(),
   pathToImage: new Map(),
-  exifCache: new Map(),
+  detailsCache: new Map(),
   viewer: {
     open: false,
     mode: null,
@@ -120,8 +120,12 @@ const elements = {
   viewerClose: document.getElementById("viewerClose"),
   viewerDetailsPanel: document.getElementById("viewerDetailsPanel"),
   viewerDetailsStatus: document.getElementById("viewerDetailsStatus"),
-  viewerDetailsTable: document.getElementById("viewerDetailsTable"),
-  viewerDetailsTableBody: document.getElementById("viewerDetailsTableBody"),
+  viewerLocationSection: document.getElementById("viewerLocationSection"),
+  viewerLocationTable: document.getElementById("viewerLocationTable"),
+  viewerLocationTableBody: document.getElementById("viewerLocationTableBody"),
+  viewerExifSection: document.getElementById("viewerExifSection"),
+  viewerExifTable: document.getElementById("viewerExifTable"),
+  viewerExifTableBody: document.getElementById("viewerExifTableBody"),
   header: document.getElementById("appHeader"),
   controlContent: document.getElementById("controlContent"),
   controlTabButtons: Array.from(document.querySelectorAll(".control-tab")),
@@ -2099,6 +2103,7 @@ function openControlPanel() {
   if (!elements.header || !elements.controlContent) {
     return;
   }
+  elements.header.classList.remove("viewer-hidden");
   if (state.controlOpen) {
     elements.controlContent.setAttribute("aria-hidden", "false");
     if (!state.flyoutPinned) {
@@ -2143,6 +2148,9 @@ function closeControlPanel() {
   }
   state.controlOpen = false;
   setHeaderCollapsed(!headerHover);
+  if (state.viewer.open && !headerHover) {
+    elements.header.classList.add("viewer-hidden");
+  }
   elements.controlContent.setAttribute("aria-hidden", "true");
   if (elements.searchInput) {
     elements.searchInput.value = "";
@@ -3064,11 +3072,23 @@ function setInfoBar(element, text, displayStyle) {
 }
 
 function clearViewerDetailsContent() {
-  if (elements.viewerDetailsTableBody) {
-    elements.viewerDetailsTableBody.innerHTML = "";
+  if (elements.viewerLocationTableBody) {
+    elements.viewerLocationTableBody.innerHTML = "";
   }
-  if (elements.viewerDetailsTable) {
-    elements.viewerDetailsTable.hidden = true;
+  if (elements.viewerExifTableBody) {
+    elements.viewerExifTableBody.innerHTML = "";
+  }
+  if (elements.viewerLocationTable) {
+    elements.viewerLocationTable.hidden = true;
+  }
+  if (elements.viewerExifTable) {
+    elements.viewerExifTable.hidden = true;
+  }
+  if (elements.viewerLocationSection) {
+    elements.viewerLocationSection.hidden = true;
+  }
+  if (elements.viewerExifSection) {
+    elements.viewerExifSection.hidden = true;
   }
   if (elements.viewerDetailsStatus) {
     elements.viewerDetailsStatus.textContent = "";
@@ -3081,45 +3101,137 @@ function showViewerDetailsMessage(message, variant = "info") {
   if (!elements.viewerDetailsStatus) {
     return;
   }
-  if (elements.viewerDetailsTable) {
-    elements.viewerDetailsTable.hidden = true;
-  }
+  clearViewerDetailsContent();
   elements.viewerDetailsStatus.textContent = message || "";
   elements.viewerDetailsStatus.hidden = !message;
   elements.viewerDetailsStatus.classList.toggle("error", variant === "error");
 }
 
-function renderViewerDetailsTable(fields) {
-  clearViewerDetailsContent();
+function appendViewerDetailsRow(tableBody, label, value, link) {
+  if (!tableBody || !label || value === null || value === undefined) {
+    return;
+  }
+  const row = document.createElement("tr");
+  const keyCell = document.createElement("th");
+  keyCell.scope = "row";
+  keyCell.textContent = label;
+  const valueCell = document.createElement("td");
+  if (link) {
+    const anchor = document.createElement("a");
+    anchor.href = link;
+    anchor.target = "_blank";
+    anchor.rel = "noopener";
+    anchor.textContent = String(value);
+    valueCell.appendChild(anchor);
+  } else {
+    valueCell.textContent = String(value);
+  }
+  row.appendChild(keyCell);
+  row.appendChild(valueCell);
+  tableBody.appendChild(row);
+}
+
+function formatDetailKey(key) {
+  return String(key || "")
+    .replace(/_/g, " ")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function renderLocationDetails(location) {
+  if (!elements.viewerLocationSection || !elements.viewerLocationTable || !elements.viewerLocationTableBody) {
+    return false;
+  }
+  const raw = location && typeof location === "object" ? location.raw : null;
+  const address = raw && typeof raw.address === "object" ? raw.address : null;
+  const poi = location && typeof location === "object" ? location.poi : null;
+
+  const lat = raw && raw.lat !== undefined ? raw.lat : null;
+  const lon = raw && raw.lon !== undefined ? raw.lon : null;
+  const mapLink = lat !== null && lon !== null
+    ? `https://www.google.com/maps?q=${encodeURIComponent(`${lat},${lon}`)}`
+    : null;
+
+  if (lat !== null) {
+    appendViewerDetailsRow(elements.viewerLocationTableBody, "Latitude", lat, mapLink);
+  }
+  if (lon !== null) {
+    appendViewerDetailsRow(elements.viewerLocationTableBody, "Longitude", lon, mapLink);
+  }
+  if (raw && raw.class !== undefined) {
+    appendViewerDetailsRow(elements.viewerLocationTableBody, "Class", raw.class);
+  }
+  if (raw && raw.type !== undefined) {
+    appendViewerDetailsRow(elements.viewerLocationTableBody, "Type", raw.type);
+  }
+  if (raw && raw.display_name) {
+    appendViewerDetailsRow(elements.viewerLocationTableBody, "Display name", raw.display_name);
+  }
+  if (address) {
+    Object.entries(address).forEach(([key, value]) => {
+      appendViewerDetailsRow(
+        elements.viewerLocationTableBody,
+        `Address ${formatDetailKey(key)}`,
+        value
+      );
+    });
+  }
+  if (poi && typeof poi === "object") {
+    Object.entries(poi).forEach(([key, value]) => {
+      appendViewerDetailsRow(
+        elements.viewerLocationTableBody,
+        `POI ${formatDetailKey(key)}`,
+        value
+      );
+    });
+  }
+
+  if (!elements.viewerLocationTableBody.childElementCount) {
+    appendViewerDetailsRow(
+      elements.viewerLocationTableBody,
+      "Location",
+      "No location data found for this image."
+    );
+  }
+  elements.viewerLocationSection.hidden = false;
+  elements.viewerLocationTable.hidden = false;
+  return true;
+}
+
+function renderExifDetails(fields) {
+  if (!elements.viewerExifSection || !elements.viewerExifTable || !elements.viewerExifTableBody) {
+    return false;
+  }
   const rows = Array.isArray(fields) ? fields : [];
-  if (!rows.length) {
-    showViewerDetailsMessage("No EXIF data found for this image.");
-    return;
-  }
-  if (!elements.viewerDetailsTable || !elements.viewerDetailsTableBody) {
-    return;
-  }
   rows.forEach((entry) => {
     const label = entry && entry.label ? String(entry.label) : "";
     const value = entry && entry.value ? String(entry.value) : "";
     if (!label || !value) {
       return;
     }
-    const row = document.createElement("tr");
-    const keyCell = document.createElement("th");
-    keyCell.scope = "row";
-    keyCell.textContent = label;
-    const valueCell = document.createElement("td");
-    valueCell.textContent = value;
-    row.appendChild(keyCell);
-    row.appendChild(valueCell);
-    elements.viewerDetailsTableBody.appendChild(row);
+    appendViewerDetailsRow(elements.viewerExifTableBody, label, value);
   });
-  if (!elements.viewerDetailsTableBody.childElementCount) {
-    showViewerDetailsMessage("No EXIF data found for this image.");
-    return;
+  if (!elements.viewerExifTableBody.childElementCount) {
+    appendViewerDetailsRow(
+      elements.viewerExifTableBody,
+      "EXIF",
+      "No EXIF data found for this image."
+    );
   }
-  elements.viewerDetailsTable.hidden = false;
+  elements.viewerExifSection.hidden = false;
+  elements.viewerExifTable.hidden = false;
+  return true;
+}
+
+function renderViewerDetails(details) {
+  clearViewerDetailsContent();
+  const location = details ? details.location : null;
+  const exifFields = details ? details.exif : null;
+  const hasLocation = renderLocationDetails(location);
+  const hasExif = renderExifDetails(exifFields);
+  if (!hasLocation && !hasExif) {
+    showViewerDetailsMessage("No details found for this image.");
+  }
 }
 
 function showViewerDetailsLoading() {
@@ -3136,9 +3248,9 @@ async function loadViewerDetails(path) {
   if (!state.viewer.detailsOpen || !path) {
     return;
   }
-  const cached = state.exifCache.get(path);
+  const cached = state.detailsCache.get(path);
   if (cached) {
-    renderViewerDetailsTable(cached);
+    renderViewerDetails(cached);
     return;
   }
   showViewerDetailsLoading();
@@ -3154,11 +3266,15 @@ async function loadViewerDetails(path) {
         value: entry && entry.value ? String(entry.value).trim() : "",
       }))
       .filter((entry) => entry.label && entry.value);
-    state.exifCache.set(path, normalized);
+    const details = {
+      exif: normalized,
+      location: response && response.location ? response.location : null,
+    };
+    state.detailsCache.set(path, details);
     if (state.viewer.detailsRequestToken !== requestToken || state.viewer.detailsPath !== path) {
       return;
     }
-    renderViewerDetailsTable(normalized);
+    renderViewerDetails(details);
   } catch (error) {
     if (state.viewer.detailsRequestToken !== requestToken || state.viewer.detailsPath !== path) {
       return;
@@ -3184,9 +3300,9 @@ function updateViewerDetails(item) {
     showViewerDetailsMessage("No image selected.");
     return;
   }
-  const cached = state.exifCache.get(path);
+  const cached = state.detailsCache.get(path);
   if (cached) {
-    renderViewerDetailsTable(cached);
+    renderViewerDetails(cached);
     return;
   }
   loadViewerDetails(path);
@@ -3618,6 +3734,18 @@ if (elements.searchInput) {
   elements.searchInput.addEventListener("input", handleSearchInputInput);
   elements.searchInput.addEventListener("keydown", handleSearchInputKeyDown);
   elements.searchInput.addEventListener("blur", handleSearchInputBlur);
+  elements.searchInput.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (!state.controlOpen) {
+      openControlPanel();
+    }
+  });
+  elements.searchInput.addEventListener("touchstart", (event) => {
+    event.stopPropagation();
+    if (!state.controlOpen) {
+      openControlPanel();
+    }
+  }, { passive: true });
 }
 
 if (elements.searchSuggestions) {
@@ -3860,6 +3988,19 @@ function setupViewerGestures() {
     await showPrevious();
   });
 
+  viewerHammer.on("tap", (ev) => {
+    if (!state.viewer.open) {
+      return;
+    }
+    const target = ev.target;
+    if (target && typeof target.closest === "function") {
+      if (target.closest(".viewer-nav, .viewer-close, #viewerDetailsPanel")) {
+        return;
+      }
+    }
+    setViewerDetailsVisibility(!state.viewer.detailsOpen);
+  });
+
 }
 
 
@@ -3938,6 +4079,10 @@ if (elements.header) {
 }
 
 if (elements.flyoutHandle) {
+  let flyoutDragActive = false;
+  let flyoutDragStartY = 0;
+  let flyoutDragTriggered = false;
+
   const activateHandle = () => {
     headerHover = true;
     if (state.controlOpen) {
@@ -3961,6 +4106,10 @@ if (elements.flyoutHandle) {
 
   elements.flyoutHandle.addEventListener("click", (event) => {
     event.preventDefault();
+    if (flyoutDragTriggered) {
+      flyoutDragTriggered = false;
+      return;
+    }
     activateHandle();
   });
 
@@ -3971,10 +4120,83 @@ if (elements.flyoutHandle) {
     }
   });
 
-  elements.flyoutHandle.addEventListener("touchstart", () => {
+  let flyoutTouchActive = false;
+  let flyoutTouchStartY = 0;
+
+  elements.flyoutHandle.addEventListener("touchstart", (event) => {
     headerHover = true;
     setHeaderCollapsed(false);
+    if (!event.touches || !event.touches.length) {
+      return;
+    }
+    flyoutTouchActive = true;
+    flyoutTouchStartY = event.touches[0].clientY;
+    flyoutDragTriggered = false;
   }, { passive: true });
+
+  elements.flyoutHandle.addEventListener("touchmove", (event) => {
+    if (!flyoutTouchActive || !event.touches || !event.touches.length) {
+      return;
+    }
+    const deltaY = event.touches[0].clientY - flyoutTouchStartY;
+    if (deltaY >= 24) {
+      flyoutDragTriggered = true;
+      if (!state.controlOpen) {
+        openControlPanel();
+      }
+      setHeaderCollapsed(false);
+    }
+  }, { passive: true });
+
+  const releaseFlyoutTouch = () => {
+    flyoutTouchActive = false;
+  };
+
+  elements.flyoutHandle.addEventListener("touchend", releaseFlyoutTouch, { passive: true });
+  elements.flyoutHandle.addEventListener("touchcancel", releaseFlyoutTouch, { passive: true });
+
+  elements.flyoutHandle.addEventListener("pointerdown", (event) => {
+    if (event.button && event.button !== 0) {
+      return;
+    }
+    flyoutDragActive = true;
+    flyoutDragStartY = event.clientY;
+    flyoutDragTriggered = false;
+    if (typeof elements.flyoutHandle.setPointerCapture === "function") {
+      elements.flyoutHandle.setPointerCapture(event.pointerId);
+    }
+  }, { passive: true });
+
+  elements.flyoutHandle.addEventListener("pointermove", (event) => {
+    if (!flyoutDragActive) {
+      return;
+    }
+    const deltaY = event.clientY - flyoutDragStartY;
+    if (deltaY >= 24) {
+      flyoutDragTriggered = true;
+      if (!state.controlOpen) {
+        openControlPanel();
+      }
+      setHeaderCollapsed(false);
+    }
+  }, { passive: true });
+
+  const releaseFlyoutPointer = (event) => {
+    if (!flyoutDragActive) {
+      return;
+    }
+    flyoutDragActive = false;
+    if (typeof elements.flyoutHandle.releasePointerCapture === "function") {
+      try {
+        elements.flyoutHandle.releasePointerCapture(event.pointerId);
+      } catch (err) {
+        // Ignore stale pointer capture release errors.
+      }
+    }
+  };
+
+  elements.flyoutHandle.addEventListener("pointerup", releaseFlyoutPointer, { passive: true });
+  elements.flyoutHandle.addEventListener("pointercancel", releaseFlyoutPointer, { passive: true });
 }
 
 document.addEventListener("click", (event) => {

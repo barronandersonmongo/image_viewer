@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
-import argparse
 import io
 import json
+import logging
+import logging.handlers
 import mimetypes
 import zipfile
+from datetime import datetime, timezone
 from http import HTTPStatus
 import http.server
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:  # Optional dependency for MongoDB metadata support
@@ -21,19 +23,23 @@ except ImportError:  # pragma: no cover - pymongo may be absent
     MongoClient = None  # type: ignore[assignment]
     Collection = None  # type: ignore[assignment]
 
-from viewer.config import (
+from config import (
     AppConfig,
     MongoConfig,
-    DEFAULT_HOST,
-    DEFAULT_PORT,
-    DEFAULT_ROOT,
-    DEFAULT_MONGO_COLLECTION,
-    DEFAULT_MONGO_DB,
-    DEFAULT_MONGO_HOLIDAY_COLLECTION,
-    DEFAULT_MONGO_URI,
+    BIND_IP,
+    PORT,
+    IMAGE_PATH_ROOT,
+    MONGO_COLLECTION,
+    MONGO_DB,
+    MONGO_HOLIDAY_COLLECTION,
+    MONGO_URI,
     STATIC_DIR,
-    THUMBNAIL_DEFAULT_SIZE,
+    THUMBNAIL_SIZE,
     THUMBNAIL_PLACEHOLDER_PATH,
+    LOG_LEVEL,
+    LOG_FILE_PATH,
+    LOG_MAX_BYTES,
+    LOG_BACKUP_COUNT,
 )
 from viewer.data_access import HolidayRepository, ImageRepository
 from viewer.exif import get_exif_metadata
@@ -58,6 +64,94 @@ IMAGE_REPOSITORY = ImageRepository(None)
 HOLIDAY_REPOSITORY = HolidayRepository(None)
 HIERARCHY_SERVICE = HierarchyService(IMAGE_REPOSITORY)
 MONGO_CLIENT: Optional["MongoClient"] = None
+LOGGER = logging.getLogger("barry_image_viewer")
+
+
+class JsonFormatter(logging.Formatter):
+    _standard_attrs = {
+        "args",
+        "asctime",
+        "created",
+        "exc_info",
+        "exc_text",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "message",
+        "module",
+        "msecs",
+        "msg",
+        "name",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "thread",
+        "threadName",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        for key, value in record.__dict__.items():
+            if key not in self._standard_attrs and not key.startswith("_"):
+                payload[key] = value
+        return json.dumps(payload, ensure_ascii=True)
+
+
+def _resolve_log_level(level: str) -> int:
+    try:
+        return int(level)
+    except (TypeError, ValueError):
+        resolved = logging.getLevelName(str(level).upper())
+        return resolved if isinstance(resolved, int) else logging.INFO
+
+
+def configure_logging() -> None:
+    level = _resolve_log_level(LOG_LEVEL)
+    formatter = JsonFormatter()
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE_PATH,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(val) for val in value]
+    return str(value)
 
 
 class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -96,7 +190,10 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     # API handlers -----------------------------------------------------
     def handle_api(self, route: str, params: Dict[str, List[str]]) -> None:
-        print(f"[HTTP] GET {route} params={params}")
+        LOGGER.info(
+            "HTTP request",
+            extra={"method": "GET", "route": route, "params": params},
+        )
         try:
             if route == "/api/list":
                 self.api_list(params)
@@ -200,7 +297,10 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json({"error": f"Invalid JSON: {exc}"}, status=HTTPStatus.BAD_REQUEST)
             return
 
-        print(f"[HTTP] POST /api/download length={length} payload={payload}")
+        LOGGER.info(
+            "HTTP request",
+            extra={"method": "POST", "route": "/api/download", "length": length},
+        )
         paths = payload.get("paths") if isinstance(payload, dict) else None
         if not isinstance(paths, list) or not paths:
             self.send_json({"error": "No images selected"}, status=HTTPStatus.BAD_REQUEST)
@@ -313,12 +413,18 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             holiday_date_values=date_values,
             holiday_names_by_value=holiday_names,
         )
-        print(f"[HTTP] /api/search results={len(results)}")
+        LOGGER.info(
+            "HTTP response",
+            extra={"route": "/api/search", "results_count": len(results)},
+        )
         self.send_json({"results": results})
 
     def api_holiday_dates(self, params: Dict[str, List[str]]) -> None:
         names = params.get("name", [])
-        print(f"[HTTP] /api/holiday-dates names={names}")
+        LOGGER.info(
+            "HTTP request",
+            extra={"method": "GET", "route": "/api/holiday-dates", "names": names},
+        )
         records = self.holiday_repository.resolve_records(names)
         self.send_json({"results": records})
 
@@ -349,9 +455,16 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         iso_dates_input = payload.get("isoDates") or []
         start_filter = payload.get("start")
         end_filter = payload.get("end")
-        print(
-            "[HTTP] POST /api/images-by-dates payload="
-            f"dateValues={date_values_input} isoDates={iso_dates_input} start={start_filter} end={end_filter}"
+        LOGGER.info(
+            "HTTP request",
+            extra={
+                "method": "POST",
+                "route": "/api/images-by-dates",
+                "date_values": date_values_input,
+                "iso_dates": iso_dates_input,
+                "start": start_filter,
+                "end": end_filter,
+            },
         )
 
         collected: List[int] = []
@@ -377,7 +490,10 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             start=start_value,
             end=end_value,
         )
-        print(f"[HTTP] /api/images-by-dates matched={len(images)}")
+        LOGGER.info(
+            "HTTP response",
+            extra={"route": "/api/images-by-dates", "results_count": len(images)},
+        )
         self.send_json({"images": images})
 
     def api_exif(self, params: Dict[str, List[str]]) -> None:
@@ -387,17 +503,32 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         resolved_relative = unquote(relative_param)
         normalized = resolved_relative.replace("\\", "/").lstrip("/")
         fields = get_exif_metadata(self.root_path, normalized)
-        self.send_json({"path": normalized, "fields": fields})
+        location = None
+        if self.image_repository and self.image_repository.available:
+            location = self.image_repository.fetch_location(normalized)
+        self.send_json(
+            {
+                "path": normalized,
+                "fields": fields,
+                "location": _json_safe(location) if location else None,
+            }
+        )
 
     def api_groups(self, params: Dict[str, List[str]]) -> None:
         order = params.get("order", ["desc"])[0].lower()
-        print(f"[HTTP] /api/groups order={order}")
+        LOGGER.info(
+            "HTTP request",
+            extra={"method": "GET", "route": "/api/groups", "order": order},
+        )
         payload = self.hierarchy_service.groups_payload(self.root_path, order)
         self.send_json(payload)
 
     def api_hierarchy(self, params: Dict[str, List[str]]) -> None:
         order = params.get("order", ["desc"])[0].lower()
-        print(f"[HTTP] /api/hierarchy order={order}")
+        LOGGER.info(
+            "HTTP request",
+            extra={"method": "GET", "route": "/api/hierarchy", "order": order},
+        )
         payload = self.hierarchy_service.hierarchy_payload(self.root_path, order)
         self.send_json(payload)
 
@@ -420,9 +551,16 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             limit,
             order,
         )
-        print(
-            f"[HTTP] /api/group-images group={group_key} cursor={cursor} order={order} limit={limit}"
-            f" count={len(payload.get('images', []))}"
+        LOGGER.info(
+            "HTTP response",
+            extra={
+                "route": "/api/group-images",
+                "group": group_key,
+                "cursor": cursor,
+                "order": order,
+                "limit": limit,
+                "results_count": len(payload.get("images", [])),
+            },
         )
         self.send_json(payload)
 
@@ -445,9 +583,16 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             order,
             limit,
         )
-        print(
-            f"[HTTP] /api/random-pool start={start_value} end={end_value} order={order} limit={limit}"
-            f" count={len(payload.get('images', []))}"
+        LOGGER.info(
+            "HTTP response",
+            extra={
+                "route": "/api/random-pool",
+                "start": start_value,
+                "end": end_value,
+                "order": order,
+                "limit": limit,
+                "results_count": len(payload.get("images", [])),
+            },
         )
         self.send_json(payload)
 
@@ -466,9 +611,15 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             limit,
             order,
         )
-        print(
-            f"[HTTP] /api/timeline cursor={cursor} order={order} limit={limit}"
-            f" count={len(payload.get('images', []))}"
+        LOGGER.info(
+            "HTTP response",
+            extra={
+                "route": "/api/timeline",
+                "cursor": cursor,
+                "order": order,
+                "limit": limit,
+                "results_count": len(payload.get("images", [])),
+            },
         )
         self.send_json(payload)
 
@@ -521,63 +672,27 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.log_message("Client closed connection while streaming file %s", path)
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003 - match base signature
-        print(f"[HTTP] {self.address_string()} - {format % args}")
+        LOGGER.info(
+            "HTTP request",
+            extra={
+                "remote": self.address_string(),
+                "detail": format % args,
+            },
+        )
 
 
-def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Barry Image Viewer web server.")
-    parser.add_argument(
-        "--root",
-        type=Path,
-        default=DEFAULT_ROOT,
-        help=f"Root directory containing images (default: {DEFAULT_ROOT})",
-    )
-    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Host to bind (default: {DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port to listen on (default: {DEFAULT_PORT})")
-    parser.add_argument(
-        "--mongo-uri",
-        default=DEFAULT_MONGO_URI,
-        help=(
-            "MongoDB connection URI. Set to an empty string to disable database-backed metadata "
-            f"(default: {DEFAULT_MONGO_URI})."
-        ),
-    )
-    parser.add_argument("--mongo-db", default=DEFAULT_MONGO_DB, help=f"MongoDB database name (default: {DEFAULT_MONGO_DB}).")
-    parser.add_argument(
-        "--mongo-collection",
-        default=DEFAULT_MONGO_COLLECTION,
-        help=f"MongoDB collection name (default: {DEFAULT_MONGO_COLLECTION}).",
-    )
-    parser.add_argument(
-        "--mongo-holiday-collection",
-        default=DEFAULT_MONGO_HOLIDAY_COLLECTION,
-        help=(
-            "MongoDB collection holding calendar/holiday documents (default: "
-            f"{DEFAULT_MONGO_HOLIDAY_COLLECTION})."
-        ),
-    )
-    parser.add_argument(
-        "--no-mongo",
-        action="store_true",
-        help="Disable MongoDB integration and fall back to filesystem scanning.",
-    )
-    return parser.parse_args(argv)
-
-
-def build_config(args: argparse.Namespace) -> AppConfig:
-    root_path = args.root.expanduser().resolve()
+def build_config() -> AppConfig:
+    root_path = IMAGE_PATH_ROOT.expanduser().resolve()
     return AppConfig(
-        host=args.host,
-        port=args.port,
+        host=BIND_IP,
+        port=PORT,
         root=root_path,
-        thumbnail_size=THUMBNAIL_DEFAULT_SIZE,
-        mongo=None
-        if args.no_mongo or not args.mongo_uri.strip()
-        else MongoConfig(
-            uri=args.mongo_uri,
-            database=args.mongo_db,
-            image_collection=args.mongo_collection,
-            holiday_collection=args.mongo_holiday_collection,
+        thumbnail_size=THUMBNAIL_SIZE,
+        mongo=MongoConfig(
+            uri=MONGO_URI,
+            database=MONGO_DB,
+            image_collection=MONGO_COLLECTION,
+            holiday_collection=MONGO_HOLIDAY_COLLECTION,
         ),
     )
 
@@ -585,7 +700,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
 def configure_mongo(config: AppConfig) -> Tuple[Optional["MongoClient"], Optional["Collection"], Optional["Collection"]]:
     if config.mongo is None or MongoClient is None:
         if config.mongo and MongoClient is None:
-            print("[WARN] pymongo not available; continuing without MongoDB support.")
+            LOGGER.warning("pymongo not available; continuing without MongoDB support.")
         return None, None, None
 
     try:
@@ -596,14 +711,20 @@ def configure_mongo(config: AppConfig) -> Tuple[Optional["MongoClient"], Optiona
         )
         client.admin.command("ping")
     except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] Failed to connect to MongoDB at {config.mongo.uri}: {exc}. Falling back to filesystem metadata.")
+        LOGGER.warning(
+            "Failed to connect to MongoDB; falling back to filesystem metadata.",
+            extra={"mongo_uri": config.mongo.uri, "error": str(exc)},
+        )
         return None, None, None
 
     image_collection = client[config.mongo.database][config.mongo.image_collection]
     holiday_collection = client[config.mongo.database][config.mongo.holiday_collection]
-    print(
-        "Using MongoDB metadata from "
-        f"{image_collection.database.name}.{image_collection.name}"
+    LOGGER.info(
+        "Using MongoDB metadata.",
+        extra={
+            "mongo_db": image_collection.database.name,
+            "mongo_collection": image_collection.name,
+        },
     )
     return client, image_collection, holiday_collection
 
@@ -613,14 +734,14 @@ def warm_cache(root: Path) -> None:
         HIERARCHY_SERVICE.sorted_image_paths(root)
         HIERARCHY_SERVICE.build(root)
     except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] Failed to warm caches: {exc}")
+        LOGGER.warning("Failed to warm caches.", extra={"error": str(exc)})
 
 
 def main() -> None:
     global APP_CONFIG, MONGO_CLIENT
 
-    args = parse_args()
-    config = build_config(args)
+    configure_logging()
+    config = build_config()
     APP_CONFIG = config
 
     if not config.root.exists():
@@ -642,12 +763,18 @@ def main() -> None:
     warm_cache(config.root)
 
     server = http.server.ThreadingHTTPServer((config.host, config.port), handler_class)
-    print(f"Serving images from {config.root}")
-    print(f"Open http://{config.host}:{config.port} in your browser")
+    LOGGER.info(
+        "Server started.",
+        extra={
+            "root": str(config.root),
+            "host": config.host,
+            "port": config.port,
+        },
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down server")
+        LOGGER.info("Shutting down server.")
     finally:
         server.server_close()
         if MONGO_CLIENT is not None:

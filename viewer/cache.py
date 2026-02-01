@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Dict, List, Optional, Tuple
 
-from .config import IMAGE_CACHE_TTL_SECONDS, EXIF_CACHE_TTL_SECONDS
+from config import IMAGE_CACHE_TTL_SECONDS, EXIF_CACHE_TTL_SECONDS
 
 
 class ImageCache:

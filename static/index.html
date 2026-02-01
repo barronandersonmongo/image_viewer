@@ -36,11 +36,13 @@
         </div>
         <section class="control-panel" id="controlPanelSearch" role="tabpanel" aria-labelledby="tabButtonSearch">
           <form id="searchForm" class="search-form">
-            <div class="search-combobox" id="searchCombobox" role="combobox" aria-expanded="false" aria-owns="searchSuggestions" aria-haspopup="listbox">
-              <input type="search" id="searchInput" placeholder="Search by date or choose a year" aria-label="Search by date" aria-autocomplete="list" aria-controls="searchSuggestions">
-              <ul class="search-suggestions" id="searchSuggestions" role="listbox" hidden></ul>
+            <div class="search-row">
+              <div class="search-combobox" id="searchCombobox" role="combobox" aria-expanded="false" aria-owns="searchSuggestions" aria-haspopup="listbox">
+                <input type="search" id="searchInput" placeholder="Search by date or choose a year" aria-label="Search by date" aria-autocomplete="list" aria-controls="searchSuggestions">
+                <ul class="search-suggestions" id="searchSuggestions" role="listbox" hidden></ul>
+              </div>
+              <button type="submit">Search</button>
             </div>
-            <button type="submit">Search</button>
           </form>
           <div class="search-results" id="searchResults"></div>
         </section>
@@ -137,9 +139,23 @@
         <div class="viewer-details-content" role="region" aria-live="polite">
           <p class="viewer-details-status" id="viewerDetailsStatus" hidden></p>
           <div class="viewer-details-scroll">
-            <table class="viewer-details-table" id="viewerDetailsTable" hidden aria-describedby="viewerDetailsTitle">
-              <tbody id="viewerDetailsTableBody"></tbody>
-            </table>
+            <div class="viewer-details-section" id="viewerLocationSection" hidden>
+              <h3 class="viewer-details-section-title">Location Details</h3>
+              <table
+                class="viewer-details-table viewer-details-table--wrap"
+                id="viewerLocationTable"
+                hidden
+                aria-describedby="viewerDetailsTitle"
+              >
+                <tbody id="viewerLocationTableBody"></tbody>
+              </table>
+            </div>
+            <div class="viewer-details-section" id="viewerExifSection" hidden>
+              <h3 class="viewer-details-section-title">EXIF Details</h3>
+              <table class="viewer-details-table" id="viewerExifTable" hidden aria-describedby="viewerDetailsTitle">
+                <tbody id="viewerExifTableBody"></tbody>
+              </table>
+            </div>
           </div>
         </div>
       </section>
@@ -149,6 +165,6 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=1"></script>
 </body>
 </html>

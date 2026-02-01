@@ -175,6 +175,22 @@ class ImageRepository:
                 doc["relative"] = relative_path_from_id(doc.get("_id"))
         return documents
 
+    def fetch_location(self, relative: str) -> Optional[Dict[str, object]]:
+        if not self.available:
+            return None
+        if not isinstance(relative, str) or not relative.strip():
+            return None
+        normalized = relative.strip().lstrip("/")
+        doc_id = f"/{normalized}"
+        try:
+            assert self.collection is not None
+            doc = self.collection.find_one({"_id": doc_id}, {"_id": 0, "location": 1})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to fetch location for {doc_id}: {exc}")
+            return None
+        location = doc.get("location") if isinstance(doc, dict) else None
+        return location if isinstance(location, dict) else None
+
     def search_by_filters(
         self,
         *,
