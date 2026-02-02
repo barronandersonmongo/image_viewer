@@ -43,6 +43,15 @@
               </div>
               <button type="submit">Search</button>
             </div>
+            <div class="search-history" aria-label="Search history">
+              <button type="button" class="search-history-button" id="searchHistoryBack" aria-label="Previous search" disabled>Back</button>
+              <button type="button" class="search-history-button" id="searchHistoryForward" aria-label="Next search" disabled>Forward</button>
+            </div>
+            <div class="search-score">
+              <label for="searchScoreInput">Score cutoff</label>
+              <input type="range" id="searchScoreInput" min="0" max="1" step="0.01" value="0.75" aria-describedby="searchScoreValue">
+              <span class="search-score-value" id="searchScoreValue">0.75</span>
+            </div>
           </form>
           <div class="search-results" id="searchResults"></div>
         </section>

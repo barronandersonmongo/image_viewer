@@ -382,6 +382,68 @@ class ImageRepository:
             print(f"[WARN] Mongo aggregation failed: {exc}")
             return []
 
+    def vector_search(
+        self,
+        *,
+        query_vector: List[float],
+        limit: int = 30,
+        num_candidates: int = 200,
+    ) -> List[Dict[str, object]]:
+        if not self.available:
+            return []
+
+        if not isinstance(query_vector, list) or not query_vector:
+            return []
+
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "images",
+                    "path": "embeddings",
+                    "queryVector": query_vector,
+                    "numCandidates": num_candidates,
+                    "limit": limit,
+                    "filter": {"embeddings": {"$exists": True, "$ne": None}},
+                }
+            },
+            {
+                "$project": {
+                    "_id": 1,
+                    "image_datetime": 1,
+                    "date_specific": 1,
+                    "location.address": 1,
+                    "location.poi": 1,
+                    "metadata_caption.text": 1,
+                    "score": {"$meta": "vectorSearchScore"},
+                }
+            },
+            {"$sort": {"score": -1}},
+        ]
+
+        try:
+            assert self.collection is not None
+            documents = list(self.collection.aggregate(pipeline, allowDiskUse=True))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Vector search failed: {exc}")
+            return []
+
+        results: List[Dict[str, object]] = []
+        for doc in documents:
+            relative = relative_path_from_id(doc.get("_id"))
+            date_value = date_value_from_datetime(doc.get("image_datetime"))
+            result = {
+                "path": relative,
+                "score": float(doc.get("score") or 0),
+                "dateValue": date_value,
+                "iso": format_date_iso(date_value) if date_value else None,
+                "dateSpecific": bool(doc.get("date_specific")),
+                "location": doc.get("location"),
+                "caption": (doc.get("metadata_caption") or {}).get("text"),
+            }
+            results.append(result)
+
+        return results
+
 
 class HolidayRepository:
     """Encapsulates MongoDB operations for the holidays collection."""

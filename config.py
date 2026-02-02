@@ -20,9 +20,12 @@ MONGO_URI = "mongodb://barry:barry@192.168.1.9:27017/"
 MONGO_DB = "barrydb"
 MONGO_COLLECTION = "images"
 MONGO_HOLIDAY_COLLECTION = "holidays"
+VOYAGE_API_KEY = "pa-hqcA1tzxO53tZFLyO5tsHfBlhgFN3GlZNWC23Aeyyeb"
+VOYAGE_EMBEDDING_MODEL = "voyage-multimodal-3.5"
 THUMBNAIL_SIZE = 320
 IMAGE_CACHE_TTL_SECONDS = 30
 EXIF_CACHE_TTL_SECONDS = 300
+SEMANTIC_SCORE_DEFAULT = 0.75
 
 # Logging defaults
 LOG_LEVEL = "INFO"
@@ -49,7 +52,10 @@ class AppConfig:
     port: int = PORT
     root: Path = IMAGE_PATH_ROOT
     thumbnail_size: int = THUMBNAIL_SIZE
+    semantic_score_default: float = SEMANTIC_SCORE_DEFAULT
     mongo: Optional[MongoConfig] = None
+    voyage_api_key: str = VOYAGE_API_KEY
+    voyage_model: str = VOYAGE_EMBEDDING_MODEL
 
     @property
     def using_database(self) -> bool:

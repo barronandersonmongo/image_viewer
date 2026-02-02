@@ -23,6 +23,11 @@ except ImportError:  # pragma: no cover - pymongo may be absent
     MongoClient = None  # type: ignore[assignment]
     Collection = None  # type: ignore[assignment]
 
+try:  # Optional dependency for Voyage embeddings
+    from voyageai import Client as VoyageClient
+except ImportError:  # pragma: no cover - voyageai may be absent
+    VoyageClient = None  # type: ignore[assignment]
+
 from config import (
     AppConfig,
     MongoConfig,
@@ -33,6 +38,9 @@ from config import (
     MONGO_DB,
     MONGO_HOLIDAY_COLLECTION,
     MONGO_URI,
+    SEMANTIC_SCORE_DEFAULT,
+    VOYAGE_API_KEY,
+    VOYAGE_EMBEDDING_MODEL,
     STATIC_DIR,
     THUMBNAIL_SIZE,
     THUMBNAIL_PLACEHOLDER_PATH,
@@ -64,6 +72,7 @@ IMAGE_REPOSITORY = ImageRepository(None)
 HOLIDAY_REPOSITORY = HolidayRepository(None)
 HIERARCHY_SERVICE = HierarchyService(IMAGE_REPOSITORY)
 MONGO_CLIENT: Optional["MongoClient"] = None
+VOYAGE_CLIENT: Optional["VoyageClient"] = None
 LOGGER = logging.getLogger("barry_image_viewer")
 
 
@@ -197,12 +206,16 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         try:
             if route == "/api/list":
                 self.api_list(params)
+            elif route == "/api/config":
+                self.api_config()
             elif route == "/api/image":
                 self.api_image(params)
             elif route == "/api/thumbnail":
                 self.api_thumbnail(params)
             elif route == "/api/search":
                 self.api_search(params)
+            elif route == "/api/search-vector":
+                self.api_search_vector(params)
             elif route == "/api/exif":
                 self.api_exif(params)
             elif route == "/api/groups":
@@ -418,6 +431,61 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
             extra={"route": "/api/search", "results_count": len(results)},
         )
         self.send_json({"results": results})
+
+    def api_search_vector(self, params: Dict[str, List[str]]) -> None:
+        query = params.get("query", [""])[0].strip()
+        if not query:
+            raise ValueError("Missing search query")
+        if VOYAGE_CLIENT is None:
+            raise ValueError("Voyage client not configured")
+        if not self.image_repository.available:
+            raise ValueError("MongoDB metadata unavailable")
+        try:
+            candidates_value = params.get("candidates", [""])[0]
+            candidates = int(candidates_value) if candidates_value else 2000
+        except ValueError as exc:
+            raise ValueError("Invalid candidates") from exc
+        candidates = max(1, min(10000, candidates))
+        limit = candidates
+        try:
+            min_score_value = params.get("min_score", [""])[0]
+            min_score = float(min_score_value) if min_score_value else self.config.semantic_score_default
+        except ValueError as exc:
+            raise ValueError("Invalid min_score") from exc
+        min_score = max(0.0, min(1.0, min_score))
+
+        if not isinstance(self.config.voyage_api_key, str) or not self.config.voyage_api_key.strip():
+            raise ValueError("Voyage API key missing")
+
+        try:
+            embed_result = VOYAGE_CLIENT.multimodal_embed(
+                model=self.config.voyage_model,
+                inputs=[[query]],
+            )
+            query_vector = embed_result.embeddings[0]
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Failed to embed query: {exc}") from exc
+
+        if not isinstance(query_vector, list):
+            raise ValueError("Invalid embedding response")
+
+        results = self.image_repository.vector_search(
+            query_vector=query_vector,
+            limit=limit,
+            num_candidates=candidates,
+        )
+        results = [result for result in results if float(result.get("score") or 0) >= min_score]
+        results.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+        LOGGER.info(
+            "HTTP response",
+            extra={"route": "/api/search-vector", "results_count": len(results)},
+        )
+        self.send_json({"results": results})
+
+    def api_config(self) -> None:
+        payload = {"semantic_score_default": self.config.semantic_score_default}
+        LOGGER.info("HTTP response", extra={"route": "/api/config"})
+        self.send_json(payload)
 
     def api_holiday_dates(self, params: Dict[str, List[str]]) -> None:
         names = params.get("name", [])
@@ -688,12 +756,15 @@ def build_config() -> AppConfig:
         port=PORT,
         root=root_path,
         thumbnail_size=THUMBNAIL_SIZE,
+        semantic_score_default=SEMANTIC_SCORE_DEFAULT,
         mongo=MongoConfig(
             uri=MONGO_URI,
             database=MONGO_DB,
             image_collection=MONGO_COLLECTION,
             holiday_collection=MONGO_HOLIDAY_COLLECTION,
         ),
+        voyage_api_key=VOYAGE_API_KEY,
+        voyage_model=VOYAGE_EMBEDDING_MODEL,
     )
 
 
@@ -738,11 +809,36 @@ def warm_cache(root: Path) -> None:
 
 
 def main() -> None:
-    global APP_CONFIG, MONGO_CLIENT
+    global APP_CONFIG, MONGO_CLIENT, VOYAGE_CLIENT
 
     configure_logging()
     config = build_config()
     APP_CONFIG = config
+
+    LOGGER.info(
+        "Startup parameters.",
+        extra={
+            "host": config.host,
+            "port": config.port,
+            "root": str(config.root),
+            "semantic_score_default": config.semantic_score_default,
+            "mongo_db": config.mongo.database if config.mongo else None,
+            "mongo_collection": config.mongo.image_collection if config.mongo else None,
+            "mongo_holiday_collection": config.mongo.holiday_collection if config.mongo else None,
+            "voyage_model": config.voyage_model,
+            "voyage_key_configured": bool(config.voyage_api_key and config.voyage_api_key.strip()),
+        },
+    )
+
+    if VoyageClient is not None and config.voyage_api_key.strip():
+        try:
+            VOYAGE_CLIENT = VoyageClient(api_key=config.voyage_api_key.strip())
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "Failed to initialize Voyage client.",
+                extra={"error": str(exc)},
+            )
+            VOYAGE_CLIENT = None
 
     if not config.root.exists():
         raise FileNotFoundError(f"Image directory not found: {config.root}")
