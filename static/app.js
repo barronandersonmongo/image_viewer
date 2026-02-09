@@ -4305,9 +4305,6 @@ function updateSearchHistoryControls() {
 function pushSearchHistory(query, results, kind) {
   const trimmedQuery = (query || "").trim();
   let items = state.searchHistory.items.slice();
-  if (state.searchHistory.cursor < items.length - 1) {
-    items = items.slice(0, state.searchHistory.cursor + 1);
-  }
   const entry = {
     id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     query: trimmedQuery,
@@ -4374,114 +4371,18 @@ function stepSearchHistory(direction) {
 async function handleSearch(event) {
   event.preventDefault();
   openControlPanel();
-  closeCombobox();
   const rawQuery = (elements.searchInput.value || "").trim();
-  const normalizedQuery = normalizeSearchText(rawQuery);
-  const tokens = normalizedQuery ? normalizedQuery.split(" ").filter(Boolean) : [];
-  if (!tokens.length) {
+  if (!rawQuery) {
     closeControlPanel();
     return;
   }
-  if (!isDateLikeQuery(rawQuery)) {
-    try {
-      const results = await fetchVectorSearch(rawQuery, { limit: 30, candidates: 200 });
-      setSearchResults(results, { pushHistory: true, query: rawQuery, kind: "vector" });
-    } catch (error) {
-      console.error("Vector search failed", error);
-      setSearchResults([], { pushHistory: true, query: rawQuery, kind: "vector" });
-    }
-    return;
-  }
-  showTimelineView();
-  const holidayTerms = [];
-  if (rawQuery) {
-    holidayTerms.push(rawQuery);
-  }
-  if (normalizedQuery && normalizedQuery !== rawQuery) {
-    holidayTerms.push(normalizedQuery);
-  }
-  if (tokens.length > 1) {
-    const joined = tokens.join(" ");
-    if (!holidayTerms.includes(joined)) {
-      holidayTerms.push(joined);
-    }
-  }
-  tokens.forEach((token) => {
-    if (token && !holidayTerms.includes(token)) {
-      holidayTerms.push(token);
-    }
-  });
-
-  let holidayMatches = [];
   try {
-    holidayMatches = await fetchHolidayDates(holidayTerms);
+    const results = await fetchVectorSearch(rawQuery, { limit: 30, candidates: 200 });
+    setSearchResults(results, { pushHistory: true, query: rawQuery, kind: "vector" });
   } catch (error) {
-    console.error("Unable to resolve holiday dates", error);
+    console.error("Vector search failed", error);
+    setSearchResults([], { pushHistory: true, query: rawQuery, kind: "vector" });
   }
-
-  const holidayIsoMap = new Map();
-  holidayMatches.forEach((item) => {
-    if (!item || !item.iso) {
-      return;
-    }
-    const isoLower = item.iso.toLowerCase();
-    const names = Array.isArray(item.names) && item.names.length ? item.names : (item.name ? [item.name] : []);
-    const existing = holidayIsoMap.get(isoLower) || new Set();
-    names.forEach((name) => existing.add(name));
-    holidayIsoMap.set(isoLower, existing);
-  });
-
-  const matches = [];
-  state.topGroups.forEach((topGroup) => {
-    const subgroups = Array.isArray(topGroup.subgroups) ? topGroup.subgroups : [];
-    subgroups.forEach((subgroup) => {
-      const haystack = buildSearchHaystack(topGroup, subgroup);
-      if (!haystack) {
-        return;
-      }
-      const subgroupDateValue = typeof subgroup.dateValue === "number" && subgroup.dateValue > 0 ? subgroup.dateValue : null;
-      const subgroupIsoLower = subgroupDateValue ? formatValueToDateString(subgroupDateValue).toLowerCase() : null;
-      const holidayNames = new Set();
-      if (subgroupIsoLower && holidayIsoMap.has(subgroupIsoLower)) {
-        holidayIsoMap.get(subgroupIsoLower).forEach((name) => holidayNames.add(name));
-      }
-      const manifest = state.imagesByGroup.get(subgroup.key) || [];
-      if (!holidayNames.size && holidayIsoMap.size && Array.isArray(manifest)) {
-        manifest.forEach((item) => {
-          if (item && typeof item.dateValue === "number" && item.dateValue > 0) {
-            const isoLower = formatValueToDateString(item.dateValue).toLowerCase();
-            if (holidayIsoMap.has(isoLower)) {
-              holidayIsoMap.get(isoLower).forEach((name) => holidayNames.add(name));
-            }
-          }
-        });
-      }
-
-      const matchesHoliday = holidayNames.size > 0;
-      const matchesQuery = tokens.every((token) => haystack.includes(token));
-      if (!matchesQuery && !matchesHoliday) {
-        return;
-      }
-      const topLabel = topGroup.formattedLabel || topGroup.label;
-      const subgroupLabel = subgroup.formattedLabel || subgroup.label;
-      const location = typeof subgroup.location === "string" ? subgroup.location : "";
-      const manifestItems = state.imagesByGroup.get(subgroup.key) || manifest;
-      const count = (manifestItems ? manifestItems.length : manifest.length) || subgroup.count || 0;
-      const match = {
-        key: subgroup.key,
-        topLabel,
-        label: subgroup.label,
-        displayLabel: subgroupLabel,
-        location,
-        count,
-      };
-      if (matchesHoliday) {
-        match.holidayNames = Array.from(holidayNames).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-      }
-      matches.push(match);
-    });
-  });
-  setSearchResults(matches, { pushHistory: true, query: rawQuery, kind: "group" });
 }
 
 function renderSearchResults(results) {
@@ -4612,26 +4513,47 @@ if (elements.searchScoreInput) {
 }
 
 if (elements.searchInput) {
-  elements.searchInput.addEventListener("focus", handleSearchInputFocus);
-  elements.searchInput.addEventListener("input", handleSearchInputInput);
-  elements.searchInput.addEventListener("keydown", handleSearchInputKeyDown);
-  elements.searchInput.addEventListener("blur", handleSearchInputBlur);
+  const selectSearchInputValue = () => {
+    if (!elements.searchInput) {
+      return;
+    }
+    const value = elements.searchInput.value || "";
+    if (!value) {
+      return;
+    }
+    elements.searchInput.select();
+    if (typeof elements.searchInput.setSelectionRange === "function") {
+      elements.searchInput.setSelectionRange(0, value.length);
+    }
+  };
+
+  const selectSearchInputValueDeferred = () => {
+    selectSearchInputValue();
+    requestAnimationFrame(() => {
+      selectSearchInputValue();
+      setTimeout(() => {
+        selectSearchInputValue();
+      }, 40);
+    });
+  };
+
+  elements.searchInput.addEventListener("focus", () => {
+    selectSearchInputValueDeferred();
+  });
   elements.searchInput.addEventListener("click", (event) => {
     event.stopPropagation();
     if (!state.controlOpen) {
       openControlPanel();
     }
+    selectSearchInputValueDeferred();
   });
   elements.searchInput.addEventListener("touchstart", (event) => {
     event.stopPropagation();
     if (!state.controlOpen) {
       openControlPanel();
     }
+    selectSearchInputValueDeferred();
   }, { passive: true });
-}
-
-if (elements.searchSuggestions) {
-  elements.searchSuggestions.addEventListener("mousedown", handleSuggestionMouseDown);
 }
 
 document.addEventListener("click", handleDocumentClick);

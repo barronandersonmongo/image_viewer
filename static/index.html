@@ -33,9 +33,8 @@
         <section class="control-panel" id="controlPanelSearch" role="tabpanel" aria-labelledby="tabButtonSearch">
           <form id="searchForm" class="search-form">
             <div class="search-row">
-              <div class="search-combobox" id="searchCombobox" role="combobox" aria-expanded="false" aria-owns="searchSuggestions" aria-haspopup="listbox">
-                <input type="search" id="searchInput" placeholder="Search by date or choose a year" aria-label="Search by date" aria-autocomplete="list" aria-controls="searchSuggestions">
-                <ul class="search-suggestions" id="searchSuggestions" role="listbox" hidden></ul>
+              <div class="search-combobox" id="searchCombobox">
+                <input type="search" id="searchInput" placeholder="Describe what you want to find" aria-label="Semantic search query">
               </div>
               <button type="submit">Search</button>
             </div>
@@ -170,6 +169,6 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
-  <script src="app.js?v=27"></script>
+  <script src="app.js?v=33"></script>
 </body>
 </html>
