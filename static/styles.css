@@ -16,19 +16,23 @@ body {
   flex-direction: column;
 }
 
+:root {
+  --ui-safe-top: env(safe-area-inset-top, 0px);
+}
+
 .flyout-handle {
   position: fixed;
   top: 0;
   left: 0;
   right: 0;
-  height: calc(12px + env(safe-area-inset-top, 0px));
-  padding-top: env(safe-area-inset-top, 0px);
+  height: calc(12px + var(--ui-safe-top));
+  padding-top: var(--ui-safe-top);
   display: flex;
   align-items: flex-end;
   justify-content: center;
   background: transparent;
   cursor: pointer;
-  z-index: 65;
+  z-index: 301;
   pointer-events: auto;
 }
 
@@ -53,12 +57,20 @@ body {
   outline: none;
 }
 
+.flyout-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(255, 0, 0, 0.6);
+  z-index: 200;
+  pointer-events: auto;
+}
+
 body.viewer-open {
   overflow: hidden;
 }
 
 #app {
-  padding-top: 48px;
+  padding-top: calc(48px + var(--ui-safe-top));
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
@@ -68,7 +80,7 @@ body.viewer-open {
 
 .app-header {
   position: fixed;
-  top: -120px;
+  top: calc(-120px + var(--ui-safe-top));
   left: 0;
   right: 0;
   background: #1e3a8a;
@@ -76,7 +88,7 @@ body.viewer-open {
   box-shadow: 0 20px 45px rgba(15, 23, 42, 0.55);
   padding: 12px 18px;
   transition: top 0.25s ease, padding 0.25s ease, box-shadow 0.25s ease;
-  z-index: 70;
+  z-index: 300;
 }
 
 .app-header.collapsed {
@@ -86,13 +98,13 @@ body.viewer-open {
 
 .app-header.show,
 .app-header.expanded {
-  top: 0;
+  top: var(--ui-safe-top);
 }
 
 @media (pointer: coarse) {
   body.viewer-open .app-header.show,
   body.viewer-open .app-header.expanded {
-    top: calc(env(safe-area-inset-top, 0px) + 84px);
+    top: var(--ui-safe-top);
   }
 }
 
@@ -101,8 +113,11 @@ body.viewer-open {
 }
 
 .app-header.viewer-hidden {
-  top: -160px !important;
   pointer-events: none;
+}
+
+.app-header.viewer-hidden.collapsed {
+  top: -160px !important;
 }
 
 .header-bar {

@@ -121,6 +121,7 @@ const state = {
     sortButtons: null,
   },
   flyoutPinned: false,
+  suppressThumbnailOpenUntil: 0,
 };
 
 const elements = {
@@ -128,6 +129,7 @@ const elements = {
   timelineSections: document.getElementById("timelineSections"),
   timelineLoader: document.getElementById("timelineLoader"),
   flyoutHandle: document.getElementById("flyoutHandle"),
+  flyoutBackdrop: document.getElementById("flyoutBackdrop"),
   viewerOverlay: document.getElementById("viewerOverlay"),
   viewerContainer: document.getElementById("viewerContainer"),
   viewerImage: document.getElementById("viewerImage"),
@@ -185,6 +187,53 @@ const elements = {
   randomViewerDateChips: document.getElementById("randomViewerDateChips"),
   flyoutPin: document.getElementById("flyoutPin"),
 };
+
+function ensureFlyoutBackdrop() {
+  if (!elements.flyoutBackdrop) {
+    const existing = document.getElementById("flyoutBackdrop");
+    if (existing) {
+      elements.flyoutBackdrop = existing;
+    }
+  }
+  if (!elements.flyoutBackdrop) {
+    const backdrop = document.createElement("div");
+    backdrop.id = "flyoutBackdrop";
+    backdrop.className = "flyout-backdrop";
+    backdrop.setAttribute("aria-hidden", "true");
+    document.body.appendChild(backdrop);
+    elements.flyoutBackdrop = backdrop;
+  }
+  if (!elements.flyoutBackdrop.__flyoutCloseBound) {
+    elements.flyoutBackdrop.addEventListener("pointerdown", (event) => {
+      consumeInteractionEvent(event);
+    });
+    elements.flyoutBackdrop.addEventListener("click", (event) => {
+      consumeInteractionEvent(event);
+      const flyoutVisible = Boolean(
+        elements.header
+          && !elements.header.classList.contains("collapsed")
+          && !state.flyoutPinned,
+      );
+      if (flyoutVisible) {
+        suppressViewerOpen();
+        closeControlPanel();
+        setHeaderCollapsed(true);
+      }
+    });
+    elements.flyoutBackdrop.__flyoutCloseBound = true;
+  }
+  if (elements.flyoutBackdrop.hasAttribute("hidden")) {
+    elements.flyoutBackdrop.removeAttribute("hidden");
+  }
+}
+
+function removeFlyoutBackdrop() {
+  if (!elements.flyoutBackdrop) {
+    return;
+  }
+  elements.flyoutBackdrop.remove();
+  elements.flyoutBackdrop = null;
+}
 
 function fetchJson(url) {
   return fetch(url).then((response) => {
@@ -1277,6 +1326,21 @@ function handleThumbnailClick(event, groupKey, index) {
   if (!button) {
     return;
   }
+  const flyoutVisible = Boolean(
+    elements.header
+      && !elements.header.classList.contains("collapsed")
+      && !state.flyoutPinned,
+  );
+  if (Date.now() < state.suppressThumbnailOpenUntil) {
+    consumeInteractionEvent(event);
+    return;
+  }
+  if (flyoutVisible) {
+    consumeInteractionEvent(event);
+    suppressViewerOpen();
+    closeControlPanel();
+    return;
+  }
   const path = button.dataset.path;
   const wantsSelection = (event.metaKey || event.ctrlKey) && path;
   if (wantsSelection) {
@@ -1294,6 +1358,21 @@ function handleThumbnailClick(event, groupKey, index) {
   }
   state.viewer.pendingBlend = 0;
   openViewerAt(groupKey, index);
+}
+
+function suppressViewerOpen(durationMs = 700) {
+  state.suppressThumbnailOpenUntil = Date.now() + Math.max(0, durationMs);
+}
+
+function consumeInteractionEvent(event) {
+  if (!event) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  if (typeof event.stopImmediatePropagation === "function") {
+    event.stopImmediatePropagation();
+  }
 }
 
 function clearDownloadSelection() {
@@ -1413,6 +1492,7 @@ function setFlyoutPinned(pinned) {
         openControlPanel();
       }
     }
+    updateFlyoutBackdropState();
     return;
   }
   state.flyoutPinned = normalized;
@@ -1425,6 +1505,7 @@ function setFlyoutPinned(pinned) {
   } else if (!state.controlOpen && !headerHover) {
     setHeaderCollapsed(true);
   }
+  updateFlyoutBackdropState();
 }
 
 function toggleFlyoutPin() {
@@ -2498,11 +2579,21 @@ function openControlPanel() {
     if (!state.flyoutPinned) {
       setHeaderCollapsed(false);
     }
+    if (!state.flyoutPinned) {
+      ensureFlyoutBackdrop();
+    } else {
+      removeFlyoutBackdrop();
+    }
     return;
   }
   state.controlOpen = true;
   setHeaderCollapsed(false);
   elements.controlContent.setAttribute("aria-hidden", "false");
+  if (!state.flyoutPinned) {
+    ensureFlyoutBackdrop();
+  } else {
+    removeFlyoutBackdrop();
+  }
   document.addEventListener("mousemove", (event) => {
   if (state.controlOpen || headerHover) {
     return;
@@ -2541,8 +2632,12 @@ function closeControlPanel() {
   if (state.flyoutPinned) {
     return;
   }
+  if (shouldUseFlyoutBackdrop()) {
+    suppressViewerOpen(1200);
+  }
   state.controlOpen = false;
   setHeaderCollapsed(!headerHover);
+  removeFlyoutBackdrop();
   if (state.viewer.open && !headerHover) {
     elements.header.classList.add("viewer-hidden");
   }
@@ -3321,6 +3416,9 @@ function updateUrlWithImage(path) {
 }
 
 function openViewerAt(groupKey, index) {
+  if (Date.now() < state.suppressThumbnailOpenUntil) {
+    return;
+  }
   const groupState = state.groups.get(groupKey);
   if (!groupState || index < 0 || index >= groupState.images.length) {
     return;
@@ -3350,6 +3448,9 @@ function openViewerAt(groupKey, index) {
 }
 
 function openVectorViewerAt(index) {
+  if (Date.now() < state.suppressThumbnailOpenUntil) {
+    return;
+  }
   const results = Array.isArray(state.vectorView.results) ? state.vectorView.results : [];
   if (index < 0 || index >= results.length) {
     return;
@@ -4658,6 +4759,37 @@ function updateFlyoutHandleState(expanded) {
   elements.flyoutHandle.setAttribute("aria-expanded", expanded ? "true" : "false");
 }
 
+function shouldUseFlyoutBackdrop() {
+  const maxTouchPoints = Number.isFinite(navigator.maxTouchPoints) ? navigator.maxTouchPoints : 0;
+  return maxTouchPoints > 0;
+}
+
+function updateFlyoutBackdropState() {
+  const visible = Boolean(
+    elements.header
+      && !elements.header.classList.contains("collapsed")
+      && !state.flyoutPinned,
+  );
+  if (visible) {
+    ensureFlyoutBackdrop();
+  } else {
+    removeFlyoutBackdrop();
+  }
+}
+
+function isInsideFlyout(target) {
+  if (!target) {
+    return false;
+  }
+  if (elements.header && elements.header.contains(target)) {
+    return true;
+  }
+  if (elements.flyoutHandle && elements.flyoutHandle.contains(target)) {
+    return true;
+  }
+  return false;
+}
+
 function setHeaderCollapsed(collapsed) {
   if (!elements.header) return;
   if (state.flyoutPinned && collapsed) {
@@ -4673,6 +4805,7 @@ function setHeaderCollapsed(collapsed) {
     elements.header.classList.add('show');
   }
   updateFlyoutHandleState(!collapsed);
+  updateFlyoutBackdropState();
 }
 
 let headerHover = false;
@@ -4716,19 +4849,10 @@ if (elements.header) {
   });
   elements.header.addEventListener("touchstart", () => {
     showHeader();
-    setTimeout(() => {
-      if (!state.controlOpen) {
-        hideHeaderIfIdle();
-      }
-    }, 1200);
   }, { passive: true });
 }
 
 if (elements.flyoutHandle) {
-  let flyoutDragActive = false;
-  let flyoutDragStartY = 0;
-  let flyoutDragTriggered = false;
-
   const activateHandle = () => {
     headerHover = true;
     if (state.controlOpen) {
@@ -4752,10 +4876,6 @@ if (elements.flyoutHandle) {
 
   elements.flyoutHandle.addEventListener("click", (event) => {
     event.preventDefault();
-    if (flyoutDragTriggered) {
-      flyoutDragTriggered = false;
-      return;
-    }
     activateHandle();
   });
 
@@ -4765,93 +4885,17 @@ if (elements.flyoutHandle) {
       activateHandle();
     }
   });
-
-  let flyoutTouchActive = false;
-  let flyoutTouchStartY = 0;
-
-  elements.flyoutHandle.addEventListener("touchstart", (event) => {
-    headerHover = true;
-    setHeaderCollapsed(false);
-    if (!event.touches || !event.touches.length) {
-      return;
-    }
-    flyoutTouchActive = true;
-    flyoutTouchStartY = event.touches[0].clientY;
-    flyoutDragTriggered = false;
-  }, { passive: true });
-
-  elements.flyoutHandle.addEventListener("touchmove", (event) => {
-    if (!flyoutTouchActive || !event.touches || !event.touches.length) {
-      return;
-    }
-    const deltaY = event.touches[0].clientY - flyoutTouchStartY;
-    if (deltaY >= 24) {
-      flyoutDragTriggered = true;
-      if (!state.controlOpen) {
-        openControlPanel();
-      }
-      setHeaderCollapsed(false);
-    }
-  }, { passive: true });
-
-  const releaseFlyoutTouch = () => {
-    flyoutTouchActive = false;
-  };
-
-  elements.flyoutHandle.addEventListener("touchend", releaseFlyoutTouch, { passive: true });
-  elements.flyoutHandle.addEventListener("touchcancel", releaseFlyoutTouch, { passive: true });
-
-  elements.flyoutHandle.addEventListener("pointerdown", (event) => {
-    if (event.button && event.button !== 0) {
-      return;
-    }
-    flyoutDragActive = true;
-    flyoutDragStartY = event.clientY;
-    flyoutDragTriggered = false;
-    if (typeof elements.flyoutHandle.setPointerCapture === "function") {
-      elements.flyoutHandle.setPointerCapture(event.pointerId);
-    }
-  }, { passive: true });
-
-  elements.flyoutHandle.addEventListener("pointermove", (event) => {
-    if (!flyoutDragActive) {
-      return;
-    }
-    const deltaY = event.clientY - flyoutDragStartY;
-    if (deltaY >= 24) {
-      flyoutDragTriggered = true;
-      if (!state.controlOpen) {
-        openControlPanel();
-      }
-      setHeaderCollapsed(false);
-    }
-  }, { passive: true });
-
-  const releaseFlyoutPointer = (event) => {
-    if (!flyoutDragActive) {
-      return;
-    }
-    flyoutDragActive = false;
-    if (typeof elements.flyoutHandle.releasePointerCapture === "function") {
-      try {
-        elements.flyoutHandle.releasePointerCapture(event.pointerId);
-      } catch (err) {
-        // Ignore stale pointer capture release errors.
-      }
-    }
-  };
-
-  elements.flyoutHandle.addEventListener("pointerup", releaseFlyoutPointer, { passive: true });
-  elements.flyoutHandle.addEventListener("pointercancel", releaseFlyoutPointer, { passive: true });
 }
 
 document.addEventListener("click", (event) => {
   if (!elements.header) {
     return;
   }
-  const inHeader = elements.header.contains(event.target);
+  const inHeader = elements.header.contains(event.target)
+    || (elements.flyoutHandle && elements.flyoutHandle.contains(event.target));
   if (state.controlOpen) {
     if (!inHeader && !state.flyoutPinned) {
+      suppressViewerOpen();
       closeControlPanel();
     }
   } else if (!inHeader && !headerHover && !state.flyoutPinned) {
@@ -4864,6 +4908,7 @@ updateRandomViewerSettingsAvailability();
 renderRandomViewerChips();
 updateFlyoutPinUI();
 setActiveControlTab(state.activeControlTab);
+updateFlyoutBackdropState();
 
 setupViewerGestures();
 
