@@ -1054,8 +1054,7 @@ function renderYearNavigation(options = []) {
   }
 
   const items = Array.isArray(options) ? options.filter((item) => item && item.key) : [];
-  const order = state.order === "asc" ? "asc" : "desc";
-  items.sort((a, b) => compareGroupOptions(a, b, order));
+  items.sort(compareYearNavigationOptions);
   if (!items.length) {
     nav.hidden = true;
     return;
@@ -1102,9 +1101,68 @@ function buildTopGroupOptions(groups) {
     count: group.count || 0,
     dateValue: typeof group.dateValue === "number" ? group.dateValue : 0,
   }));
-  const order = state.order === "asc" ? "asc" : "desc";
-  options.sort((a, b) => compareGroupOptions(a, b, order));
+  options.sort(compareYearNavigationOptions);
   renderYearNavigation(options);
+}
+
+function parseNumericGroupLabel(label) {
+  const normalized = (label || "").toString().trim();
+  if (/^-?\d+$/.test(normalized)) {
+    const parsed = Number.parseInt(normalized, 10);
+    if (Number.isFinite(parsed)) {
+      return {
+        category: "exact",
+        value: parsed,
+      };
+    }
+  }
+
+  // Support uncertain year-like labels such as 197X, 19XX, 1XXX (case-insensitive x).
+  // These are treated as numeric with trailing X interpreted as 0.
+  if (/^\d{1,3}[xX]{1,3}$/.test(normalized) && normalized.length === 4) {
+    const numeric = normalized.replace(/[xX]/g, "0");
+    const parsed = Number.parseInt(numeric, 10);
+    if (Number.isFinite(parsed)) {
+      return {
+        category: "fuzzy",
+        value: parsed,
+      };
+    }
+  }
+
+  return null;
+}
+
+function compareYearNavigationOptions(a, b) {
+  const aLabel = (a && a.label ? a.label : "").toString();
+  const bLabel = (b && b.label ? b.label : "").toString();
+  const aNumeric = parseNumericGroupLabel(aLabel);
+  const bNumeric = parseNumericGroupLabel(bLabel);
+
+  if (aNumeric !== null && bNumeric !== null) {
+    if (aNumeric.value !== bNumeric.value) {
+      return bNumeric.value - aNumeric.value;
+    }
+    if (aNumeric.category !== bNumeric.category) {
+      return aNumeric.category === "exact" ? -1 : 1;
+    }
+    return aLabel.localeCompare(bLabel, undefined, { numeric: true, sensitivity: "base" });
+  }
+  if (aNumeric !== null) {
+    return -1;
+  }
+  if (bNumeric !== null) {
+    return 1;
+  }
+
+  const alphaCompare = aLabel.localeCompare(bLabel, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+  if (alphaCompare !== 0) {
+    return alphaCompare;
+  }
+  return 0;
 }
 
 function shuffleArray(items) {
