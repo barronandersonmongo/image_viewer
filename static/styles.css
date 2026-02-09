@@ -582,7 +582,10 @@ body.viewer-open {
 .search-result.empty {
   border: none;
   background: none;
-  color: rgba(241, 245, 249, 0.5);
+  color: #f87171;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
   cursor: default;
 }
 

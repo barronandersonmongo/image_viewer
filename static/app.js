@@ -44,9 +44,11 @@ const MONTH_ABBREVIATIONS = [
 const CONTROL_TABS = ["search", "year", "random"];
 const STORAGE_KEYS = {
   semanticScoreCutoff: "barryImageViewer.semanticScoreCutoff",
+  vectorSortPreference: "barryImageViewer.vectorSortPreference",
 };
 const STORAGE_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 let semanticScoreSyncTimer = null;
+let vectorSortPreferenceDirty = false;
 
 const state = {
   order: initialOrder,
@@ -56,12 +58,6 @@ const state = {
   topGroups: [],
   topGroupIndex: 0,
   topGroupStatus: new Map(),
-  topGroupOptions: [],
-  combobox: {
-    open: false,
-    activeIndex: -1,
-    filtered: [],
-  },
   groups: new Map(),
   groupSequence: [],
   groupIndexMap: new Map(),
@@ -123,7 +119,9 @@ const state = {
     query: "",
     results: [],
     sort: "score",
+    sortDirections: { score: "desc", date: "desc" },
     sortButtons: null,
+    cardsByKey: new Map(),
   },
   flyoutPinned: false,
   suppressThumbnailOpenUntil: 0,
@@ -164,8 +162,6 @@ const elements = {
   },
   searchForm: document.getElementById("searchForm"),
   searchInput: document.getElementById("searchInput"),
-  searchCombobox: document.getElementById("searchCombobox"),
-  searchSuggestions: document.getElementById("searchSuggestions"),
   searchResults: document.getElementById("searchResults"),
   searchHistoryBack: document.getElementById("searchHistoryBack"),
   searchHistoryForward: document.getElementById("searchHistoryForward"),
@@ -311,6 +307,131 @@ function persistSemanticScoreCutoff(value) {
     // Fall back to cookie-based persistence if localStorage is blocked.
   }
   document.cookie = `${encodeURIComponent(STORAGE_KEYS.semanticScoreCutoff)}=${encodeURIComponent(normalized)}; path=/; max-age=${STORAGE_COOKIE_MAX_AGE}; samesite=lax`;
+}
+
+function normalizeVectorSortPreference(input) {
+  const fallback = { sort: "score", sortDirections: { score: "desc", date: "desc" } };
+  if (!input || typeof input !== "object") {
+    return fallback;
+  }
+  const sort = input.sort === "date" ? "date" : "score";
+  const scoreDirection = input.sortDirections && input.sortDirections.score === "asc" ? "asc" : "desc";
+  const dateDirection = input.sortDirections && input.sortDirections.date === "asc" ? "asc" : "desc";
+  return {
+    sort,
+    sortDirections: {
+      score: scoreDirection,
+      date: dateDirection,
+    },
+  };
+}
+
+function getPersistedVectorSortPreference() {
+  const cookiePrefix = `${encodeURIComponent(STORAGE_KEYS.vectorSortPreference)}=`;
+  const cookieValue = document.cookie
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(cookiePrefix));
+  if (cookieValue) {
+    try {
+      const decoded = decodeURIComponent(cookieValue.slice(cookiePrefix.length));
+      const parsed = JSON.parse(decoded);
+      return normalizeVectorSortPreference(parsed);
+    } catch (error) {
+      // Fall through to localStorage fallback.
+    }
+  }
+
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEYS.vectorSortPreference);
+    if (!raw) {
+      return normalizeVectorSortPreference(null);
+    }
+    const decoded = decodeURIComponent(raw);
+    const parsed = JSON.parse(decoded);
+    return normalizeVectorSortPreference(parsed);
+  } catch (error) {
+    return normalizeVectorSortPreference(null);
+  }
+}
+
+function persistVectorSortPreference() {
+  const current = normalizeVectorSortPreference({
+    sort: state.vectorView && state.vectorView.sort,
+    sortDirections: state.vectorView && state.vectorView.sortDirections,
+  });
+  const serialized = encodeURIComponent(JSON.stringify(current));
+  document.cookie = `${encodeURIComponent(STORAGE_KEYS.vectorSortPreference)}=${serialized}; path=/; max-age=${STORAGE_COOKIE_MAX_AGE}; samesite=lax`;
+  try {
+    window.localStorage.setItem(STORAGE_KEYS.vectorSortPreference, serialized);
+  } catch (error) {
+    // Ignore storage failures.
+  }
+}
+
+async function saveVectorSortPreferenceToServer() {
+  const current = normalizeVectorSortPreference({
+    sort: state.vectorView && state.vectorView.sort,
+    sortDirections: state.vectorView && state.vectorView.sortDirections,
+  });
+  const response = await fetch("/api/ui-state", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      vector_sort: current.sort,
+      vector_sort_score_direction: current.sortDirections.score,
+      vector_sort_date_direction: current.sortDirections.date,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to persist vector sort preference (${response.status})`);
+  }
+  vectorSortPreferenceDirty = false;
+}
+
+function flushVectorSortPreferenceToServer() {
+  const current = normalizeVectorSortPreference({
+    sort: state.vectorView && state.vectorView.sort,
+    sortDirections: state.vectorView && state.vectorView.sortDirections,
+  });
+  const payload = JSON.stringify({
+    vector_sort: current.sort,
+    vector_sort_score_direction: current.sortDirections.score,
+    vector_sort_date_direction: current.sortDirections.date,
+  });
+  if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+    const blob = new Blob([payload], { type: "application/json" });
+    navigator.sendBeacon("/api/ui-state", blob);
+    return;
+  }
+  saveVectorSortPreferenceToServer().catch(() => {});
+}
+
+async function loadVectorSortPreferenceFromServer() {
+  try {
+    const payload = await fetchJson("/api/ui-state");
+    const fromServer = normalizeVectorSortPreference({
+      sort: payload && payload.vector_sort,
+      sortDirections: {
+        score: payload && payload.vector_sort_score_direction,
+        date: payload && payload.vector_sort_date_direction,
+      },
+    });
+    state.vectorView.sort = fromServer.sort;
+    state.vectorView.sortDirections = fromServer.sortDirections;
+    persistVectorSortPreference();
+    vectorSortPreferenceDirty = false;
+    if (state.vectorView && state.vectorView.root) {
+      updateVectorSortButtons();
+      if (state.vectorView.active) {
+        renderVectorResultsGrid();
+      }
+    }
+  } catch (error) {
+    // Non-fatal; cookie/localStorage preference remains in effect.
+  }
 }
 
 async function saveSemanticScoreCutoffToServer(value) {
@@ -491,6 +612,10 @@ function ensureVectorViewContainer() {
   panel.appendChild(grid);
 
   elements.timeline.insertBefore(root, elements.timelineSections || null);
+  const initialPreference = normalizeVectorSortPreference({
+    sort: state.vectorView && state.vectorView.sort,
+    sortDirections: state.vectorView && state.vectorView.sortDirections,
+  });
 
   state.vectorView = {
     active: false,
@@ -500,8 +625,10 @@ function ensureVectorViewContainer() {
     grid,
     query: "",
     results: [],
-    sort: "score",
+    sort: initialPreference.sort,
+    sortDirections: initialPreference.sortDirections,
     sortButtons: { score: scoreButton, date: dateButton },
+    cardsByKey: new Map(),
   };
   sortControls.addEventListener("click", (event) => {
     const button = event.target.closest(".vector-sort-button");
@@ -513,9 +640,14 @@ function ensureVectorViewContainer() {
       return;
     }
     if (state.vectorView.sort === sort) {
-      return;
+      const currentDirection = state.vectorView.sortDirections[sort] === "asc" ? "asc" : "desc";
+      state.vectorView.sortDirections[sort] = currentDirection === "asc" ? "desc" : "asc";
+    } else {
+      state.vectorView.sort = sort;
     }
-    state.vectorView.sort = sort;
+    vectorSortPreferenceDirty = true;
+    persistVectorSortPreference();
+    saveVectorSortPreferenceToServer().catch(() => {});
     updateVectorSortButtons();
     renderVectorResultsGrid();
   });
@@ -534,8 +666,16 @@ function updateVectorSortButtons() {
       return;
     }
     const isActive = key === activeSort;
+    const direction = state.vectorView.sortDirections[key] === "asc" ? "asc" : "desc";
+    const directionArrow = direction === "asc" ? "\u2191" : "\u2193";
+    const label = key === "score" ? "Score" : "Date";
     button.classList.toggle("active", isActive);
     button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    button.textContent = `${label} ${directionArrow}`;
+    button.setAttribute(
+      "aria-label",
+      `${label} sort ${direction === "asc" ? "ascending" : "descending"}${isActive ? ", active" : ""}`,
+    );
   });
 }
 
@@ -564,10 +704,11 @@ function renderVectorResultsGrid() {
   view.grid.innerHTML = "";
 
   const sorted = results.slice().sort((a, b) => {
+    const sortDirection = view.sortDirections[view.sort] === "asc" ? "asc" : "desc";
+    const direction = sortDirection === "asc" ? 1 : -1;
     if (view.sort === "date") {
       const dateA = Number.isFinite(a.dateValue) ? a.dateValue : 0;
       const dateB = Number.isFinite(b.dateValue) ? b.dateValue : 0;
-      const direction = state.order === "asc" ? 1 : -1;
       if (dateA !== dateB) {
         return direction * (dateA - dateB);
       }
@@ -578,11 +719,11 @@ function renderVectorResultsGrid() {
     const scoreA = typeof a.score === "number" ? a.score : 0;
     const scoreB = typeof b.score === "number" ? b.score : 0;
     if (scoreA !== scoreB) {
-      return scoreB - scoreA;
+      return direction * (scoreA - scoreB);
     }
     const dateA = Number.isFinite(a.dateValue) ? a.dateValue : 0;
     const dateB = Number.isFinite(b.dateValue) ? b.dateValue : 0;
-    return dateB - dateA;
+    return direction * (dateA - dateB);
   });
 
   if (!sorted.length) {
@@ -593,39 +734,53 @@ function renderVectorResultsGrid() {
     return;
   }
 
+  const cardCache = view.cardsByKey instanceof Map ? view.cardsByKey : new Map();
+  view.cardsByKey = cardCache;
+
   sorted.forEach((match) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "thumbnail-button";
-    if (match.path) {
-      button.dataset.path = match.path;
-    } else {
-      button.disabled = true;
+    const key = match.__vectorKey || match.path || "";
+    let button = cardCache.get(key);
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "thumbnail-button";
+      if (match.path) {
+        button.dataset.path = match.path;
+      } else {
+        button.disabled = true;
+      }
+
+      const tile = document.createElement("div");
+      tile.className = "thumbnail-tile";
+      if (match.path) {
+        const img = document.createElement("img");
+        img.loading = "lazy";
+        img.alt = match.path.split("/").pop() || "";
+        img.src = `/api/thumbnail?path=${encodeURIComponent(match.path)}`;
+        img.addEventListener("error", () => {
+          if (!img.dataset.retried) {
+            img.dataset.retried = "true";
+            img.src = "/thumbnail-placeholder.svg";
+          }
+        });
+        tile.appendChild(img);
+      }
+
+      const caption = document.createElement("div");
+      caption.className = "thumbnail-caption";
+
+      button.appendChild(tile);
+      button.appendChild(caption);
+      cardCache.set(key, button);
     }
-    button.addEventListener("click", () => {
+
+    button.onclick = () => {
       if (match.path) {
         openVectorImage(match.path);
       }
-    });
+    };
 
-    const tile = document.createElement("div");
-    tile.className = "thumbnail-tile";
-    if (match.path) {
-      const img = document.createElement("img");
-      img.loading = "lazy";
-      img.alt = match.path.split("/").pop() || "";
-      img.src = `/api/thumbnail?path=${encodeURIComponent(match.path)}`;
-      img.addEventListener("error", () => {
-        if (!img.dataset.retried) {
-          img.dataset.retried = "true";
-          img.src = "/thumbnail-placeholder.svg";
-        }
-      });
-      tile.appendChild(img);
-    }
-
-    const caption = document.createElement("div");
-    caption.className = "thumbnail-caption";
+    const caption = button.querySelector(".thumbnail-caption");
     const label = formatVectorResultLabel(match);
     const parts = [];
     if (label) {
@@ -634,10 +789,9 @@ function renderVectorResultsGrid() {
     if (typeof match.score === "number") {
       parts.push(`Score ${match.score.toFixed(3)}`);
     }
-    caption.textContent = parts.join(" • ") || (match.path || "");
-
-    button.appendChild(tile);
-    button.appendChild(caption);
+    if (caption) {
+      caption.textContent = parts.join(" • ") || (match.path || "");
+    }
     view.grid.appendChild(button);
   });
 }
@@ -653,7 +807,14 @@ function showVectorResultsView(results, query) {
   }
   state.vectorView.active = true;
   state.vectorView.query = query || "";
-  state.vectorView.results = Array.isArray(results) ? results : [];
+  state.vectorView.results = (Array.isArray(results) ? results : []).map((result, index) => {
+    const pathKey = result && result.path ? result.path : "";
+    const keyBase = `idx:${index}:path:${pathKey}`;
+    return {
+      ...(result || {}),
+      __vectorKey: keyBase,
+    };
+  });
   if (elements.timelineSections) {
     elements.timelineSections.hidden = true;
   }
@@ -843,120 +1004,6 @@ function setActiveControlTab(tab) {
       panel.setAttribute("aria-hidden", key === target ? "false" : "true");
     }
   });
-  if (target !== "search") {
-    closeCombobox();
-  }
-}
-
-function normalizeSearchText(text) {
-  if (text === null || text === undefined) {
-    return "";
-  }
-  return text
-    .toString()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function buildSearchHaystack(topGroup, subgroup) {
-  const parts = [];
-  const topLabel = topGroup ? (topGroup.formattedLabel || topGroup.label || "") : "";
-  const subgroupLabel = subgroup ? (subgroup.formattedLabel || subgroup.label || "") : "";
-  const subgroupKey = subgroup ? subgroup.key || "" : "";
-  const subgroupRawLabel = subgroup ? subgroup.label || "" : "";
-  const location = subgroup && typeof subgroup.location === "string" ? subgroup.location : "";
-
-  [topLabel, subgroupLabel, subgroupRawLabel, subgroupKey, location]
-    .filter((value) => value)
-    .forEach((value) => parts.push(value));
-
-  const dateValueRaw = subgroup && subgroup.dateValue !== undefined ? Number(subgroup.dateValue) : NaN;
-  if (Number.isFinite(dateValueRaw) && dateValueRaw > 0) {
-    const year = Math.floor(dateValueRaw / 10000);
-    const month = Math.floor((dateValueRaw % 10000) / 100);
-    const day = dateValueRaw % 100;
-    if (year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-      const paddedMonth = String(month).padStart(2, "0");
-      const paddedDay = String(day).padStart(2, "0");
-      parts.push(
-        `${year}${paddedMonth}${paddedDay}`,
-        `${year} ${paddedMonth} ${paddedDay}`,
-        `${paddedMonth} ${paddedDay} ${year}`,
-        `${paddedDay} ${paddedMonth} ${year}`,
-      );
-      const monthName = MONTH_NAMES[month] || "";
-      const monthAbbr = MONTH_ABBREVIATIONS[month] || "";
-      if (monthName) {
-        parts.push(
-          `${monthName} ${day} ${year}`,
-          `${day} ${monthName} ${year}`,
-        );
-      }
-      if (monthAbbr) {
-        parts.push(
-          `${monthAbbr} ${day} ${year}`,
-          `${day} ${monthAbbr} ${year}`,
-        );
-      }
-    }
-  }
-
-  return normalizeSearchText(parts.join(" "));
-}
-
-function updateComboboxAria() {
-  if (!elements.searchCombobox) {
-    return;
-  }
-  const expanded = state.combobox.open && state.combobox.filtered.length > 0;
-  elements.searchCombobox.setAttribute("aria-expanded", expanded ? "true" : "false");
-}
-
-function renderComboboxOptions() {
-  const list = elements.searchSuggestions;
-  if (!list) {
-    return;
-  }
-  const options = state.combobox.filtered || [];
-  list.innerHTML = "";
-
-  if (!state.combobox.open || !options.length) {
-    list.hidden = true;
-    elements.searchInput.removeAttribute("aria-activedescendant");
-    updateComboboxAria();
-    return;
-  }
-
-  options.forEach((option, index) => {
-    const item = document.createElement("li");
-    const safeId = `suggestion-${option.key.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
-    item.id = safeId;
-    item.className = "search-suggestion";
-    item.setAttribute("role", "option");
-    item.dataset.key = option.key;
-    if (option.count !== undefined) {
-      item.innerHTML = `<span>${option.label}</span><small>${option.count.toLocaleString()} photos</small>`;
-    } else {
-      item.textContent = option.label;
-    }
-    if (index === state.combobox.activeIndex) {
-      item.setAttribute("aria-selected", "true");
-      elements.searchInput.setAttribute("aria-activedescendant", safeId);
-    }
-    item.addEventListener("click", () => {
-      selectComboboxOption(option);
-    });
-    list.appendChild(item);
-  });
-
-  if (state.combobox.activeIndex === -1) {
-    elements.searchInput.removeAttribute("aria-activedescendant");
-  }
-
-  list.hidden = false;
-  updateComboboxAria();
 }
 
 function renderYearNavigation(options = []) {
@@ -1021,16 +1068,12 @@ function buildTopGroupOptions(groups) {
   const options = (Array.isArray(groups) ? groups : []).map((group) => ({
     key: group.key,
     label: group.formattedLabel || group.label,
-    normalizedLabel: normalizeSearchText(group.formattedLabel || group.label || ""),
     count: group.count || 0,
     dateValue: typeof group.dateValue === "number" ? group.dateValue : 0,
   }));
   const order = state.order === "asc" ? "asc" : "desc";
   options.sort((a, b) => compareGroupOptions(a, b, order));
-  state.topGroupOptions = options;
-  state.combobox.filtered = options.slice();
   renderYearNavigation(options);
-  renderComboboxOptions();
 }
 
 function shuffleArray(items) {
@@ -1062,48 +1105,6 @@ function compareGroupOptions(a, b, order = "desc") {
     return normalized === "asc" ? labelCompare : -labelCompare;
   }
   return 0;
-}
-
-function openCombobox() {
-  if (!state.topGroupOptions.length) {
-    return;
-  }
-  state.combobox.open = true;
-  state.combobox.filtered = [...state.topGroupOptions];
-  state.combobox.activeIndex = -1;
-  renderComboboxOptions();
-}
-
-function closeCombobox() {
-  state.combobox.open = false;
-  state.combobox.activeIndex = -1;
-  state.combobox.filtered = state.topGroupOptions.slice();
-  const list = elements.searchSuggestions;
-  if (list) {
-    list.hidden = true;
-    list.innerHTML = "";
-  }
-  elements.searchInput.removeAttribute("aria-activedescendant");
-  updateComboboxAria();
-}
-
-function filterComboboxOptions(query) {
-  if (!state.topGroupOptions.length) {
-    state.combobox.filtered = [];
-    renderComboboxOptions();
-    return;
-  }
-  const normalized = normalizeSearchText(query);
-  const tokens = normalized ? normalized.split(" ").filter(Boolean) : [];
-  const filtered = tokens.length
-    ? state.topGroupOptions.filter((option) => {
-        const labelText = option.normalizedLabel || normalizeSearchText(option.label || "");
-        return tokens.every((token) => labelText.includes(token));
-      })
-    : [...state.topGroupOptions];
-  state.combobox.filtered = filtered;
-  state.combobox.activeIndex = -1;
-  renderComboboxOptions();
 }
 
 function navigateToTopGroup(topKey) {
@@ -1675,20 +1676,6 @@ function parseDateToValue(dateString) {
     }
   }
   return null;
-}
-
-function isDateLikeQuery(query) {
-  if (!query) {
-    return false;
-  }
-  const normalized = query.trim();
-  if (!normalized) {
-    return false;
-  }
-  if (parseDateToValue(normalized)) {
-    return true;
-  }
-  return /^\d{4}$/.test(normalized);
 }
 
 function formatValueToDateString(value) {
@@ -2587,103 +2574,6 @@ async function addRandomViewerSpecificDate() {
   }
 }
 
-function selectComboboxOption(option) {
-  if (!option) {
-    return;
-  }
-  elements.searchInput.value = option.label;
-  navigateToTopGroup(option.key);
-  closeCombobox();
-  elements.searchResults.innerHTML = "";
-  elements.searchInput.focus();
-}
-
-function moveComboboxHighlight(direction) {
-  if (!state.combobox.open) {
-    openCombobox();
-  }
-  const options = state.combobox.filtered;
-  if (!options.length) {
-    return;
-  }
-  let index = state.combobox.activeIndex;
-  if (index === -1) {
-    index = direction > 0 ? 0 : options.length - 1;
-  } else {
-    index = (index + direction + options.length) % options.length;
-  }
-  state.combobox.activeIndex = index;
-  renderComboboxOptions();
-}
-
-function handleSearchInputFocus() {
-  if (!state.topGroupOptions.length) {
-    return;
-  }
-  openCombobox();
-}
-
-function handleSearchInputInput(event) {
-  if (!state.topGroupOptions.length) {
-    return;
-  }
-  if (!state.combobox.open) {
-    openCombobox();
-  }
-  filterComboboxOptions(event.target.value);
-}
-
-function handleSearchInputKeyDown(event) {
-  if (event.key === "ArrowDown") {
-    event.preventDefault();
-    moveComboboxHighlight(1);
-  } else if (event.key === "ArrowUp") {
-    event.preventDefault();
-    moveComboboxHighlight(-1);
-  } else if (event.key === "Enter") {
-    if (state.combobox.open && state.combobox.activeIndex >= 0) {
-      event.preventDefault();
-      const option = state.combobox.filtered[state.combobox.activeIndex];
-      selectComboboxOption(option);
-    } else {
-      closeCombobox();
-    }
-  } else if (event.key === "Escape") {
-    if (state.combobox.open) {
-      event.preventDefault();
-      closeCombobox();
-    }
-  } else if (event.key === "Tab") {
-    closeCombobox();
-  }
-}
-
-let comboboxBlurTimeout = null;
-
-function handleSearchInputBlur() {
-  comboboxBlurTimeout = setTimeout(() => {
-    closeCombobox();
-  }, 120);
-}
-
-function handleSuggestionMouseDown(event) {
-  event.preventDefault();
-  if (comboboxBlurTimeout) {
-    clearTimeout(comboboxBlurTimeout);
-    comboboxBlurTimeout = null;
-  }
-}
-
-function handleDocumentClick(event) {
-  if (!elements.searchCombobox) {
-    return;
-  }
-  if (!elements.searchCombobox.contains(event.target)) {
-    closeCombobox();
-  }
-}
-
-
 function openControlPanel() {
   if (!elements.header || !elements.controlContent) {
     return;
@@ -2710,6 +2600,9 @@ function openControlPanel() {
     removeFlyoutBackdrop();
   }
   document.addEventListener("mousemove", (event) => {
+  if (Date.now() < suppressHeaderAutoRevealUntil) {
+    return;
+  }
   if (state.controlOpen || headerHover) {
     return;
   }
@@ -2721,6 +2614,9 @@ function openControlPanel() {
 });
 
 document.addEventListener("touchstart", (event) => {
+  if (Date.now() < suppressHeaderAutoRevealUntil) {
+    return;
+  }
   if (!event.touches || !event.touches.length) {
     return;
   }
@@ -2792,12 +2688,6 @@ function resetStateForOrder() {
   state.topGroups = [];
   state.topGroupIndex = 0;
   state.topGroupStatus = new Map();
-  state.topGroupOptions = [];
-  state.combobox = {
-    open: false,
-    activeIndex: -1,
-    filtered: [],
-  };
   state.viewer = {
     open: false,
     groupKey: null,
@@ -2815,10 +2705,6 @@ function resetStateForOrder() {
     specificList: [],
   };
   elements.timelineSections.innerHTML = "";
-  if (elements.searchSuggestions) {
-    elements.searchSuggestions.hidden = true;
-    elements.searchSuggestions.innerHTML = "";
-  }
   if (elements.yearNavigationButtons) {
     elements.yearNavigationButtons.innerHTML = "";
   }
@@ -2831,9 +2717,6 @@ function resetStateForOrder() {
   setActiveControlTab(state.activeControlTab);
   renderRandomViewerChips();
   updateRandomViewerSettingsAvailability();
-  if (elements.searchCombobox) {
-    elements.searchCombobox.setAttribute("aria-expanded", "false");
-  }
   if (imageObserver) {
     imageObserver.disconnect();
     imageObserver = null;
@@ -4368,6 +4251,21 @@ function stepSearchHistory(direction) {
   applySearchHistoryIndex(nextIndex);
 }
 
+function focusAndSelectSearchInput() {
+  if (!elements.searchInput) {
+    return;
+  }
+  elements.searchInput.focus();
+  const value = elements.searchInput.value || "";
+  if (!value) {
+    return;
+  }
+  elements.searchInput.select();
+  if (typeof elements.searchInput.setSelectionRange === "function") {
+    elements.searchInput.setSelectionRange(0, value.length);
+  }
+}
+
 async function handleSearch(event) {
   event.preventDefault();
   openControlPanel();
@@ -4379,9 +4277,22 @@ async function handleSearch(event) {
   try {
     const results = await fetchVectorSearch(rawQuery, { limit: 30, candidates: 200 });
     setSearchResults(results, { pushHistory: true, query: rawQuery, kind: "vector" });
+    if (Array.isArray(results) && results.length > 0) {
+      suppressHeaderAutoReveal(1200);
+      if (state.flyoutPinned) {
+        setFlyoutPinned(false, { collapseOnUnpin: true });
+      } else {
+        closeControlPanel();
+        headerHover = false;
+        setHeaderCollapsed(true);
+      }
+    } else {
+      focusAndSelectSearchInput();
+    }
   } catch (error) {
     console.error("Vector search failed", error);
     setSearchResults([], { pushHistory: true, query: rawQuery, kind: "vector" });
+    focusAndSelectSearchInput();
   }
 }
 
@@ -4555,8 +4466,6 @@ if (elements.searchInput) {
     selectSearchInputValueDeferred();
   }, { passive: true });
 }
-
-document.addEventListener("click", handleDocumentClick);
 
 if (elements.yearNavigationButtons) {
   elements.yearNavigationButtons.addEventListener("click", (event) => {
@@ -4862,8 +4771,16 @@ function setHeaderCollapsed(collapsed) {
 
 let headerHover = false;
 let headerShownRecently = false;
+let suppressHeaderAutoRevealUntil = 0;
+
+function suppressHeaderAutoReveal(durationMs = 900) {
+  suppressHeaderAutoRevealUntil = Date.now() + Math.max(0, durationMs);
+}
 
 function showHeader() {
+  if (Date.now() < suppressHeaderAutoRevealUntil) {
+    return;
+  }
   headerHover = true;
   setHeaderCollapsed(false);
   headerShownRecently = true;
@@ -4916,6 +4833,9 @@ if (elements.flyoutHandle) {
   };
 
   elements.flyoutHandle.addEventListener("mouseenter", () => {
+    if (Date.now() < suppressHeaderAutoRevealUntil) {
+      return;
+    }
     headerHover = true;
     setHeaderCollapsed(false);
   });
@@ -5018,29 +4938,44 @@ window.addEventListener("popstate", () => {
 });
 
 window.addEventListener("beforeunload", () => {
-  if (!elements.searchScoreInput) {
-    return;
+  if (elements.searchScoreInput) {
+    const value = getSemanticScoreCutoff();
+    persistSemanticScoreCutoff(value);
+    flushSemanticScoreCutoffToServer(value);
   }
-  const value = getSemanticScoreCutoff();
-  persistSemanticScoreCutoff(value);
-  flushSemanticScoreCutoffToServer(value);
+  if (vectorSortPreferenceDirty) {
+    persistVectorSortPreference();
+    flushVectorSortPreferenceToServer();
+  }
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "hidden" || !elements.searchScoreInput) {
+  if (document.visibilityState !== "hidden") {
     return;
   }
-  const value = getSemanticScoreCutoff();
-  persistSemanticScoreCutoff(value);
-  flushSemanticScoreCutoffToServer(value);
+  if (elements.searchScoreInput) {
+    const value = getSemanticScoreCutoff();
+    persistSemanticScoreCutoff(value);
+    flushSemanticScoreCutoffToServer(value);
+  }
+  if (vectorSortPreferenceDirty) {
+    persistVectorSortPreference();
+    flushVectorSortPreferenceToServer();
+  }
 });
 
 function init() {
+  const vectorSortPreference = getPersistedVectorSortPreference();
+  state.vectorView.sort = vectorSortPreference.sort;
+  state.vectorView.sortDirections = vectorSortPreference.sortDirections;
   updateOrderUI();
   updateSearchHistoryControls();
   applySemanticScoreDefault();
   loadAppConfigDefaults()
-    .finally(() => loadSemanticScoreCutoffFromServer());
+    .finally(() => Promise.allSettled([
+      loadSemanticScoreCutoffFromServer(),
+      loadVectorSortPreferenceFromServer(),
+    ]));
   if (elements.controlContent) {
     elements.controlContent.setAttribute("aria-hidden", "true");
   }

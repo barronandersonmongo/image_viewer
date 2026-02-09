@@ -77,7 +77,12 @@ VOYAGE_CLIENT: Optional["VoyageClient"] = None
 LOGGER = logging.getLogger("barry_image_viewer")
 UI_STATE_PATH = STATIC_DIR / ".ui_state.json"
 UI_STATE_LOCK = threading.Lock()
-UI_STATE_ALLOWED_KEYS = {"semantic_score_cutoff"}
+UI_STATE_ALLOWED_KEYS = {
+    "semantic_score_cutoff",
+    "vector_sort",
+    "vector_sort_score_direction",
+    "vector_sort_date_direction",
+}
 
 
 def _read_ui_state_unlocked() -> Dict[str, object]:
@@ -575,6 +580,27 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json({"error": "semantic_score_cutoff must be numeric"}, status=HTTPStatus.BAD_REQUEST)
                 return
             update["semantic_score_cutoff"] = max(0.0, min(1.0, value))
+
+        if "vector_sort" in payload:
+            value = str(payload["vector_sort"]).strip().lower()
+            if value not in {"score", "date"}:
+                self.send_json({"error": "vector_sort must be 'score' or 'date'"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            update["vector_sort"] = value
+
+        if "vector_sort_score_direction" in payload:
+            value = str(payload["vector_sort_score_direction"]).strip().lower()
+            if value not in {"asc", "desc"}:
+                self.send_json({"error": "vector_sort_score_direction must be 'asc' or 'desc'"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            update["vector_sort_score_direction"] = value
+
+        if "vector_sort_date_direction" in payload:
+            value = str(payload["vector_sort_date_direction"]).strip().lower()
+            if value not in {"asc", "desc"}:
+                self.send_json({"error": "vector_sort_date_direction must be 'asc' or 'desc'"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            update["vector_sort_date_direction"] = value
 
         if not update:
             self.send_json({"error": "No supported fields provided"}, status=HTTPStatus.BAD_REQUEST)
