@@ -5,30 +5,30 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Barry Image Viewer</title>
   <link rel="icon" type="image/x-icon" href="favicon.ico">
-  <link rel="stylesheet" href="styles.css?v=3">
+  <link rel="stylesheet" href="styles.css?v=5">
 </head>
 <body>
   <div id="flyoutHandle" class="flyout-handle" role="button" aria-label="Open controls" aria-controls="appHeader" aria-expanded="false" tabindex="0"></div>
   <div id="flyoutBackdrop" class="flyout-backdrop" hidden aria-hidden="true"></div>
   <div id="app">
     <header class="app-header collapsed" id="appHeader">
-      <div class="header-bar">
-        <div class="header-controls">
-          <div class="order-switch" id="orderSwitch" role="group" aria-label="Sort order">
-            <button type="button" class="order-option active" data-order="desc" aria-pressed="true">Newest</button>
-            <button type="button" class="order-option" data-order="asc" aria-pressed="false">Oldest</button>
-          </div>
-          <button type="button" class="flyout-pin" id="flyoutPin" aria-pressed="false" aria-label="Pin controls">
-            <span class="pin-indicator" aria-hidden="true"></span>
-            <span class="pin-text">Auto</span>
-          </button>
-        </div>
-      </div>
       <div class="control-content" id="controlContent" aria-hidden="true">
-        <div class="control-tabs" role="tablist">
-          <button type="button" class="control-tab active" data-tab="search" id="tabButtonSearch" role="tab" aria-selected="true" aria-controls="controlPanelSearch">Search</button>
-          <button type="button" class="control-tab" data-tab="year" id="tabButtonYear" role="tab" aria-selected="false" aria-controls="controlPanelYear">Year</button>
-          <button type="button" class="control-tab" data-tab="random" id="tabButtonRandom" role="tab" aria-selected="false" aria-controls="controlPanelRandom">Random</button>
+        <div class="control-topbar">
+          <div class="control-tabs" role="tablist">
+            <button type="button" class="control-tab active" data-tab="search" id="tabButtonSearch" role="tab" aria-selected="true" aria-controls="controlPanelSearch">Search</button>
+            <button type="button" class="control-tab" data-tab="year" id="tabButtonYear" role="tab" aria-selected="false" aria-controls="controlPanelYear">Year</button>
+            <button type="button" class="control-tab" data-tab="random" id="tabButtonRandom" role="tab" aria-selected="false" aria-controls="controlPanelRandom">Random</button>
+          </div>
+          <div class="header-controls">
+            <div class="order-switch" id="orderSwitch" role="group" aria-label="Sort order">
+              <button type="button" class="order-option active" data-order="desc" aria-pressed="true">Newest</button>
+              <button type="button" class="order-option" data-order="asc" aria-pressed="false">Oldest</button>
+            </div>
+            <button type="button" class="flyout-pin" id="flyoutPin" aria-pressed="false" aria-label="Pin controls">
+              <span class="pin-indicator" aria-hidden="true"></span>
+              <span class="pin-text">Auto</span>
+            </button>
+          </div>
         </div>
         <section class="control-panel" id="controlPanelSearch" role="tabpanel" aria-labelledby="tabButtonSearch">
           <form id="searchForm" class="search-form">
