@@ -131,6 +131,8 @@ const elements = {
   timeline: document.getElementById("timeline"),
   timelineSections: document.getElementById("timelineSections"),
   timelineLoader: document.getElementById("timelineLoader"),
+  semanticReturn: document.getElementById("semanticReturn"),
+  semanticReturnLink: document.getElementById("semanticReturnLink"),
   flyoutHandle: document.getElementById("flyoutHandle"),
   flyoutBackdrop: document.getElementById("flyoutBackdrop"),
   viewerOverlay: document.getElementById("viewerOverlay"),
@@ -549,6 +551,7 @@ function showTimelineView() {
   if (elements.timelineSections) {
     elements.timelineSections.hidden = false;
   }
+  updateSemanticReturnControl();
 }
 
 function ensureVectorViewContainer() {
@@ -562,9 +565,19 @@ function ensureVectorViewContainer() {
   root.className = "top-group vector-view";
   root.hidden = true;
 
+  const rootHeader = document.createElement("div");
+  rootHeader.className = "vector-view-header";
+  root.appendChild(rootHeader);
+
   const heading = document.createElement("h2");
   heading.textContent = "Search results";
-  root.appendChild(heading);
+  rootHeader.appendChild(heading);
+
+  const backLink = document.createElement("a");
+  backLink.href = "#";
+  backLink.className = "vector-back-link";
+  backLink.textContent = "Back to Timeline";
+  rootHeader.appendChild(backLink);
 
   const panel = document.createElement("div");
   panel.className = "subgroup-section";
@@ -630,6 +643,10 @@ function ensureVectorViewContainer() {
     sortButtons: { score: scoreButton, date: dateButton },
     cardsByKey: new Map(),
   };
+  backLink.addEventListener("click", (event) => {
+    event.preventDefault();
+    showTimelineView();
+  });
   sortControls.addEventListener("click", (event) => {
     const button = event.target.closest(".vector-sort-button");
     if (!button) {
@@ -667,7 +684,7 @@ function updateVectorSortButtons() {
     }
     const isActive = key === activeSort;
     const direction = state.vectorView.sortDirections[key] === "asc" ? "asc" : "desc";
-    const directionArrow = direction === "asc" ? "\u2191" : "\u2193";
+    const directionArrow = direction === "asc" ? "\u25B2" : "\u25BC";
     const label = key === "score" ? "Score" : "Date";
     button.classList.toggle("active", isActive);
     button.setAttribute("aria-pressed", isActive ? "true" : "false");
@@ -828,6 +845,20 @@ function showVectorResultsView(results, query) {
   }
   updateVectorSortButtons();
   renderVectorResultsGrid();
+  updateSemanticReturnControl();
+}
+
+function updateSemanticReturnControl() {
+  if (!elements.semanticReturn) {
+    return;
+  }
+  const hasRecentSemanticResults = Boolean(
+    state.vectorView
+      && !state.vectorView.active
+      && Array.isArray(state.vectorView.results)
+      && state.vectorView.results.length > 0,
+  );
+  elements.semanticReturn.hidden = !hasRecentSemanticResults;
 }
 
 function openVectorImage(path) {
@@ -4402,6 +4433,17 @@ if (elements.searchHistoryForward) {
   });
 }
 
+if (elements.semanticReturnLink) {
+  elements.semanticReturnLink.addEventListener("click", (event) => {
+    event.preventDefault();
+    if (!state.vectorView || !Array.isArray(state.vectorView.results) || !state.vectorView.results.length) {
+      return;
+    }
+    showVectorResultsView(state.vectorView.results, state.vectorView.query || "");
+    renderVectorResultsSummary(state.vectorView.results);
+  });
+}
+
 if (elements.searchForm) {
   elements.searchForm.addEventListener("submit", (event) => {
     handleSearch(event).catch((error) => console.error("Search failed", error));
@@ -4881,6 +4923,7 @@ renderRandomViewerChips();
 updateFlyoutPinUI();
 setActiveControlTab(state.activeControlTab);
 updateFlyoutBackdropState();
+updateSemanticReturnControl();
 
 setupViewerGestures();
 
