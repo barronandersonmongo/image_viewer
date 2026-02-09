@@ -4,10 +4,12 @@ const SUBGROUP_BATCH_SIZE = 6;
 const THUMBNAILS_PER_GROUP = 20;
 const RANDOM_POOL_LIMIT = 2000;
 const SEARCH_HISTORY_LIMIT = 8;
+const VIEWER_PRELOAD_CACHE_LIMIT = 12;
 
 const urlParams = new URLSearchParams(window.location.search);
 const initialOrder = urlParams.get("order") === "asc" ? "asc" : "desc";
 const initialImageParam = urlParams.get("image");
+const initialViewerDebugParam = (urlParams.get("viewerDebug") || "").trim().toLowerCase();
 
 const MONTH_NAMES = [
   "",
@@ -45,10 +47,17 @@ const CONTROL_TABS = ["search", "year", "random"];
 const STORAGE_KEYS = {
   semanticScoreCutoff: "barryImageViewer.semanticScoreCutoff",
   vectorSortPreference: "barryImageViewer.vectorSortPreference",
+  viewerDebug: "barryImageViewer.viewerDebug",
 };
 const STORAGE_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 let semanticScoreSyncTimer = null;
 let vectorSortPreferenceDirty = false;
+const VIEWER_MODE_BEHAVIOR = Object.freeze({
+  group: { showClose: true, showNav: true, showInfo: true, allowDetails: true, allowOverlayClose: true },
+  vector: { showClose: true, showNav: true, showInfo: true, allowDetails: true, allowOverlayClose: true },
+  random: { showClose: false, showNav: false, showInfo: false, allowDetails: false, allowOverlayClose: false },
+  default: { showClose: true, showNav: true, showInfo: true, allowDetails: true, allowOverlayClose: true },
+});
 
 const state = {
   order: initialOrder,
@@ -75,6 +84,16 @@ const state = {
     detailsPath: null,
     detailsLoading: false,
     detailsRequestToken: null,
+    preloadCache: new Map(),
+    preloadToken: 0,
+    debug: {
+      enabled: false,
+      currentPath: null,
+      nextPath: null,
+      prevPath: null,
+      cacheSize: 0,
+      status: "idle",
+    },
   },
   initialImagePath: initialImageParam,
   activeThumb: null,
@@ -189,7 +208,137 @@ const elements = {
   randomViewerAddDate: document.getElementById("randomViewerAddDate"),
   randomViewerDateChips: document.getElementById("randomViewerDateChips"),
   flyoutPin: document.getElementById("flyoutPin"),
+  viewerDebugPanel: document.getElementById("viewerDebugPanel"),
 };
+
+function isTruthyFlag(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function readViewerDebugPreference() {
+  if (isTruthyFlag(initialViewerDebugParam)) {
+    return true;
+  }
+  try {
+    const localValue = window.localStorage.getItem(STORAGE_KEYS.viewerDebug);
+    if (typeof localValue === "string") {
+      return isTruthyFlag(localValue);
+    }
+  } catch (_error) {
+    // Ignore storage errors and default to disabled.
+  }
+  return false;
+}
+
+function ensureViewerDebugPanel() {
+  if (!elements.viewerContainer) {
+    return null;
+  }
+  if (elements.viewerDebugPanel && elements.viewerDebugPanel.isConnected) {
+    return elements.viewerDebugPanel;
+  }
+  const panel = document.createElement("aside");
+  panel.id = "viewerDebugPanel";
+  panel.className = "viewer-debug-panel";
+  panel.setAttribute("aria-live", "polite");
+  panel.setAttribute("aria-hidden", "true");
+  panel.hidden = true;
+  elements.viewerContainer.appendChild(panel);
+  elements.viewerDebugPanel = panel;
+  return panel;
+}
+
+function renderViewerDebugPanel() {
+  const panel = ensureViewerDebugPanel();
+  if (!panel) {
+    return;
+  }
+  const mode = state.viewer.mode;
+  const supportedMode = mode === "group";
+  const isVisible = Boolean(state.viewer.open && supportedMode && state.viewer.debug.enabled);
+  panel.hidden = !isVisible;
+  panel.setAttribute("aria-hidden", isVisible ? "false" : "true");
+  if (!isVisible) {
+    return;
+  }
+  const currentPath = state.viewer.debug.currentPath || "(none)";
+  const nextPath = state.viewer.debug.nextPath || "(none)";
+  const prevPath = state.viewer.debug.prevPath || "(none)";
+  const cacheSize = Number.isFinite(state.viewer.debug.cacheSize) ? state.viewer.debug.cacheSize : 0;
+  const status = state.viewer.debug.status || "idle";
+  panel.textContent = [
+    "Viewer Debug (Shift+D)",
+    `mode: ${mode || "(none)"}`,
+    `status: ${status}`,
+    `cache: ${cacheSize}`,
+    `current: ${currentPath}`,
+    `next: ${nextPath}`,
+    `prev: ${prevPath}`,
+  ].join("\n");
+}
+
+function setViewerDebugEnabled(enabled) {
+  state.viewer.debug.enabled = Boolean(enabled);
+  try {
+    window.localStorage.setItem(STORAGE_KEYS.viewerDebug, state.viewer.debug.enabled ? "1" : "0");
+  } catch (_error) {
+    // Ignore storage errors.
+  }
+  renderViewerDebugPanel();
+}
+
+function getViewerModeBehavior(mode = state.viewer.mode) {
+  return VIEWER_MODE_BEHAVIOR[mode] || VIEWER_MODE_BEHAVIOR.default;
+}
+
+function isViewerDetailsEnabledForMode(mode = state.viewer.mode) {
+  return Boolean(getViewerModeBehavior(mode).allowDetails);
+}
+
+function isViewerOverlayDismissEnabled(mode = state.viewer.mode) {
+  return Boolean(getViewerModeBehavior(mode).allowOverlayClose);
+}
+
+function applyViewerModePresentation() {
+  const mode = state.viewer.mode;
+  const modeBehavior = getViewerModeBehavior(mode);
+  const modeClasses = ["viewer-mode-group", "viewer-mode-vector", "viewer-mode-random"];
+  const modeClass = mode ? `viewer-mode-${mode}` : null;
+  const isOpen = Boolean(state.viewer.open);
+
+  if (elements.viewerContainer) {
+    elements.viewerContainer.classList.remove(...modeClasses);
+    if (isOpen && modeClass) {
+      elements.viewerContainer.classList.add(modeClass);
+    }
+  }
+
+  if (elements.viewerClose) {
+    elements.viewerClose.hidden = !isOpen || !modeBehavior.showClose;
+  }
+  if (elements.viewerPrev) {
+    elements.viewerPrev.hidden = !isOpen || !modeBehavior.showNav;
+  }
+  if (elements.viewerNext) {
+    elements.viewerNext.hidden = !isOpen || !modeBehavior.showNav;
+  }
+
+  [elements.viewerInfoTop, elements.viewerInfoBottom, elements.viewerInfoLeft, elements.viewerInfoRight].forEach((node) => {
+    if (!node) {
+      return;
+    }
+    node.hidden = !isOpen || !modeBehavior.showInfo;
+  });
+
+  if (!modeBehavior.allowDetails && state.viewer.detailsOpen) {
+    setViewerDetailsVisibility(false);
+  }
+  renderViewerDebugPanel();
+}
 
 function ensureFlyoutBackdrop() {
   if (!elements.flyoutBackdrop) {
@@ -2016,6 +2165,7 @@ function displayRandomViewerImage(choice) {
       elements.header.classList.add("viewer-hidden");
     }
   }
+  applyViewerModePresentation();
   prepareViewerTransition(blendDuration);
   showViewerLoading(blendDuration);
   setViewerNavDisabled(true);
@@ -2064,7 +2214,7 @@ function displayRandomViewerImage(choice) {
   };
   const handleError = () => {
     setInfoBar(elements.viewerInfoTop, "Failed to load image", "block");
-    setInfoBar(elements.viewerInfoBottom, item.name || "", item.name ? "block" : "none");
+    setInfoBar(elements.viewerInfoBottom, "", "none");
     setInfoBar(elements.viewerInfoLeft, "", "block");
     setInfoBar(elements.viewerInfoRight, "", "block");
     updateViewerDetails(null);
@@ -2106,6 +2256,11 @@ function stopRandomViewer({ resetToggle = true } = {}) {
     elements.viewerImageOverlay.style.opacity = "0";
     elements.viewerImageOverlay.hidden = true;
   }
+  if (state.viewer.open && state.viewer.mode === "random") {
+    closeViewer();
+    return;
+  }
+  applyViewerModePresentation();
   updateRandomViewerSettingsAvailability();
 }
 
@@ -2777,15 +2932,28 @@ function resetStateForOrder() {
   state.topGroups = [];
   state.topGroupIndex = 0;
   state.topGroupStatus = new Map();
+  const debugEnabled = Boolean(state.viewer && state.viewer.debug && state.viewer.debug.enabled);
   state.viewer = {
     open: false,
+    mode: null,
     groupKey: null,
     index: -1,
+    vectorPaths: [],
     pendingBlend: 0,
     detailsOpen: false,
     detailsPath: null,
     detailsLoading: false,
     detailsRequestToken: null,
+    preloadCache: new Map(),
+    preloadToken: 0,
+    debug: {
+      enabled: debugEnabled,
+      currentPath: null,
+      nextPath: null,
+      prevPath: null,
+      cacheSize: 0,
+      status: "idle",
+    },
   };
   state.randomViewer.filter = {
     start: null,
@@ -2996,6 +3164,7 @@ function createSubgroup(topGroup, subgroup) {
     manifest,
     images: [],
     renderedCount: 0,
+    hydratedCount: 0,
     pendingHydration: totalCount > 0,
     selectedCount: existingSelected,
     nextCursor: null,
@@ -3017,6 +3186,8 @@ function createSubgroup(topGroup, subgroup) {
   }
 
   updateGroupSelectionStatus(groupState.key);
+  renderInitialGroupPlaceholders(groupState);
+  renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
 
   return groupState;
 }
@@ -3028,6 +3199,102 @@ function updateGroupIndexMap() {
   });
 }
 
+function createThumbnailPlaceholderEntry(groupState, index, meta = {}) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "thumbnail-button placeholder";
+  button.classList.add("downloadable");
+  button.disabled = true;
+  button.tabIndex = -1;
+  button.setAttribute("aria-hidden", "true");
+  button.setAttribute("aria-checked", "false");
+  button.dataset.groupKey = groupState.key;
+  button.dataset.index = String(index);
+  if (meta.path) {
+    button.dataset.path = meta.path;
+  }
+
+  button.addEventListener("click", (event) => {
+    handleThumbnailClick(event, groupState.key, index);
+  });
+
+  let entryRef = null;
+  const indicator = document.createElement("span");
+  indicator.className = "thumbnail-select-indicator";
+  indicator.setAttribute("role", "checkbox");
+  indicator.setAttribute("aria-checked", "false");
+  indicator.setAttribute("aria-label", "Select for download");
+  indicator.setAttribute("tabindex", "0");
+  indicator.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!entryRef || !entryRef.path || state.download.inProgress) {
+      return;
+    }
+    toggleImageSelection(entryRef.path, groupState.key);
+  });
+  indicator.addEventListener("keydown", (event) => {
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!entryRef || !entryRef.path || state.download.inProgress) {
+        return;
+      }
+      toggleImageSelection(entryRef.path, groupState.key);
+    }
+  });
+  button.appendChild(indicator);
+
+  const tile = document.createElement("div");
+  tile.className = "thumbnail-tile placeholder";
+  button.appendChild(tile);
+
+  const caption = document.createElement("div");
+  caption.className = "thumbnail-caption placeholder";
+  button.appendChild(caption);
+
+  const entry = {
+    name: typeof meta.name === "string" ? meta.name : `Image ${index + 1}`,
+    path: typeof meta.path === "string" ? meta.path : null,
+    dateHint: meta.dateHint || null,
+    element: button,
+    loaded: false,
+    loading: false,
+  };
+  entryRef = entry;
+  return entry;
+}
+
+function renderInitialGroupPlaceholders(groupState) {
+  if (!groupState || !groupState.grid || groupState.renderedCount > 0) {
+    return;
+  }
+  const total = Number.isFinite(groupState.total) ? Math.max(0, groupState.total) : 0;
+  if (total === 0) {
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  const manifest = Array.isArray(groupState.manifest) ? groupState.manifest : [];
+  for (let index = 0; index < total; index += 1) {
+    const meta = manifest[index] || {};
+    const entry = createThumbnailPlaceholderEntry(groupState, index, meta);
+    groupState.images[index] = entry;
+    if (entry.path) {
+      state.pathToImage.set(entry.path, { groupKey: groupState.key, index });
+    }
+    if (entry.path && state.download.items.has(entry.path)) {
+      setThumbnailSelectionState(entry.element, true);
+    }
+    fragment.appendChild(entry.element);
+  }
+  groupState.grid.appendChild(fragment);
+  groupState.renderedCount = total;
+  if (groupState.pendingHydration) {
+    groupState.pendingHydration = false;
+    groupState.container.classList.remove("pending-hydration");
+  }
+}
+
 function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
   if (!groupState) {
     return;
@@ -3037,106 +3304,41 @@ function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
   if (!Array.isArray(manifest) || !manifest.length) {
     return;
   }
-  const startIndex = groupState.renderedCount || 0;
-  const total = manifest.length;
-  if (startIndex >= total) {
+  const startIndex = groupState.hydratedCount || 0;
+  if (startIndex >= manifest.length) {
     return;
   }
-  const endIndex = Math.min(total, startIndex + batchSize);
-  const fragment = document.createDocumentFragment();
+  const endIndex = Math.min(manifest.length, startIndex + batchSize);
 
   for (let index = startIndex; index < endIndex; index += 1) {
     const meta = manifest[index] || {};
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "thumbnail-button placeholder";
-    button.classList.add("downloadable");
-    button.disabled = true;
-    button.tabIndex = -1;
-    button.setAttribute("aria-hidden", "true");
-    button.setAttribute("aria-checked", "false");
-    button.dataset.groupKey = groupState.key;
-    button.dataset.index = String(index);
-    if (meta.path) {
-      button.dataset.path = meta.path;
+    const entry = groupState.images[index];
+    if (!entry) {
+      continue;
     }
-
-    button.addEventListener("click", (event) => {
-      handleThumbnailClick(event, groupState.key, index);
-    });
-
-    let entryRef = null;
-    const indicator = document.createElement("span");
-    indicator.className = "thumbnail-select-indicator";
-    indicator.setAttribute("role", "checkbox");
-    indicator.setAttribute("aria-checked", "false");
-    indicator.setAttribute("aria-label", "Select for download");
-    indicator.setAttribute("tabindex", "0");
-    indicator.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (!entryRef || !entryRef.path || state.download.inProgress) {
-        return;
+    const hadPath = Boolean(entry.path);
+    if (typeof meta.name === "string" && meta.name) {
+      entry.name = meta.name;
+    }
+    if (!entry.dateHint && meta.dateHint) {
+      entry.dateHint = meta.dateHint;
+    }
+    if (typeof meta.path === "string" && meta.path) {
+      entry.path = meta.path;
+      state.pathToImage.set(meta.path, { groupKey: groupState.key, index });
+      if (entry.element) {
+        entry.element.dataset.path = meta.path;
       }
-      toggleImageSelection(entryRef.path, groupState.key);
-    });
-    indicator.addEventListener("keydown", (event) => {
-      if (event.key === " " || event.key === "Enter") {
-        event.preventDefault();
-        event.stopPropagation();
-        if (!entryRef || !entryRef.path || state.download.inProgress) {
-          return;
+      if (!hadPath || !entry.loaded) {
+        entry.loaded = false;
+        entry.loading = false;
+        if (entry.element) {
+          observePlaceholder(groupState, index, entry.element);
         }
-        toggleImageSelection(entryRef.path, groupState.key);
-      }
-    });
-    button.appendChild(indicator);
-
-    const tile = document.createElement("div");
-    tile.className = "thumbnail-tile placeholder";
-    button.appendChild(tile);
-
-    const caption = document.createElement("div");
-    caption.className = "thumbnail-caption placeholder";
-    button.appendChild(caption);
-
-    const entry = {
-      name: typeof meta.name === "string" ? meta.name : `Image ${index + 1}`,
-      path: typeof meta.path === "string" ? meta.path : null,
-      dateHint: meta.dateHint || null,
-      element: button,
-      loaded: false,
-      loading: false,
-    };
-    entryRef = entry;
-    groupState.images[index] = entry;
-    if (entry.path) {
-      state.pathToImage.set(entry.path, { groupKey: groupState.key, index });
-    }
-
-    if (entry.path && state.download.items.has(entry.path)) {
-      setThumbnailSelectionState(button, true);
-    }
-
-    fragment.appendChild(button);
-  }
-
-  if (fragment.childNodes.length) {
-    groupState.grid.appendChild(fragment);
-    for (let index = startIndex; index < endIndex; index += 1) {
-      const entry = groupState.images[index];
-      if (entry && entry.element) {
-        observePlaceholder(groupState, index, entry.element);
       }
     }
   }
-
-  if (groupState.pendingHydration) {
-    groupState.pendingHydration = false;
-    groupState.container.classList.remove("pending-hydration");
-  }
-
-  groupState.renderedCount = endIndex;
+  groupState.hydratedCount = endIndex;
   updateGroupSelectionStatus(groupState.key);
 }
 
@@ -3145,29 +3347,58 @@ function maybeRenderMoreThumbnails(groupState, viewport, margin) {
     return;
   }
   groupState.manifest = state.imagesByGroup.get(groupState.key) || groupState.manifest || [];
-  const manifestLength = Array.isArray(groupState.manifest) ? groupState.manifest.length : 0;
-  if (groupState.renderedCount >= manifestLength) {
-    if (!groupState.fullyLoaded) {
-      ensureGroupManifestCount(groupState, groupState.renderedCount + THUMBNAILS_PER_GROUP)
-        .then(() => {
-          const updatedManifest = state.imagesByGroup.get(groupState.key) || [];
-          if (groupState.renderedCount < updatedManifest.length) {
-            renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
-          }
-        })
-        .catch((error) => console.error(error));
+  const visibleIndices = [];
+  const items = Array.isArray(groupState.images) ? groupState.images : [];
+  const topBound = viewport.top - margin;
+  const bottomBound = viewport.bottom + margin;
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (!item || !item.element) {
+      continue;
     }
+    const rect = item.element.getBoundingClientRect();
+    if (rect.bottom < topBound || rect.top > bottomBound) {
+      continue;
+    }
+    visibleIndices.push(index);
+  }
+  if (!visibleIndices.length) {
     return;
   }
-  const lastElement = groupState.grid.lastElementChild;
-  if (!lastElement) {
-    renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
+
+  const maxVisibleIndex = visibleIndices[visibleIndices.length - 1];
+  const targetHydrationCount = maxVisibleIndex + 1 + THUMBNAILS_PER_GROUP;
+  const hydrateBound = () => {
+    const manifestLength = Array.isArray(groupState.manifest) ? groupState.manifest.length : 0;
+    const desired = Math.min(targetHydrationCount, manifestLength);
+    let hydratedCount = groupState.hydratedCount || 0;
+    while (hydratedCount < desired) {
+      const before = hydratedCount;
+      renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
+      hydratedCount = groupState.hydratedCount || 0;
+      if (hydratedCount <= before) {
+        break;
+      }
+    }
+    visibleIndices.forEach((index) => {
+      const entry = groupState.images[index];
+      if (!entry || !entry.path || entry.loaded || entry.loading) {
+        return;
+      }
+      loadImageEntry(groupState, index);
+    });
+  };
+
+  const currentManifestLength = Array.isArray(groupState.manifest) ? groupState.manifest.length : 0;
+  if (currentManifestLength >= targetHydrationCount || groupState.fullyLoaded) {
+    hydrateBound();
     return;
   }
-  const rect = lastElement.getBoundingClientRect();
-  if (rect.top < viewport.bottom + margin) {
-    renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
-  }
+  ensureGroupManifestCount(groupState, targetHydrationCount, { force: true })
+    .then(() => {
+      hydrateBound();
+    })
+    .catch((error) => console.error(error));
 }
 
 function maybeRenderMoreTopGroups() {
@@ -3253,10 +3484,23 @@ function handlePlaceholderEntries(entries) {
     const index = Number(button.dataset.index);
     const groupState = state.groups.get(groupKey);
     if (groupState && Number.isInteger(index) && index >= 0) {
+      const imageEntry = groupState.images[index];
+      if (!imageEntry || !imageEntry.path) {
+        ensureGroupManifestCount(groupState, index + 1, { force: true })
+          .then(() => {
+            renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
+          })
+          .catch((error) => console.error(error));
+        return;
+      }
       loadImageEntry(groupState, index);
     }
     const observerInstance = ensureImageObserver();
-    if (observerInstance) {
+    if (observerInstance && groupState && Number.isInteger(index) && index >= 0) {
+      const hydrated = groupState.images[index];
+      if (!hydrated || !hydrated.path) {
+        return;
+      }
       observerInstance.unobserve(button);
     }
   });
@@ -3290,7 +3534,10 @@ function observePlaceholder(groupState, index, element) {
 
 function loadImageEntry(groupState, index) {
   const entry = groupState.images[index];
-  if (!entry || entry.loaded || entry.loading) {
+  if (!entry || entry.loading || entry.loaded) {
+    return;
+  }
+  if (!entry.path) {
     return;
   }
   const button = entry.element;
@@ -3359,8 +3606,8 @@ async function ensureGroupLoaded(groupKey, options = {}) {
   }
   const desiredCount = Math.max(options.minCount || THUMBNAILS_PER_GROUP, THUMBNAILS_PER_GROUP);
   await ensureGroupManifestCount(groupState, desiredCount, { force });
-  if (groupState.renderedCount === 0 && groupState.manifest.length) {
-    renderNextThumbnails(groupState, Math.min(THUMBNAILS_PER_GROUP, groupState.manifest.length));
+  if ((groupState.hydratedCount || 0) < groupState.manifest.length) {
+    renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
   }
 }
 
@@ -3493,6 +3740,230 @@ function getAdjacentGroupKey(currentKey, direction) {
   return state.groupSequence[nextIndex];
 }
 
+function getCurrentViewerPath() {
+  if (!state.viewer.open) {
+    return null;
+  }
+  if (state.viewer.mode === "vector") {
+    const results = Array.isArray(state.vectorView.results) ? state.vectorView.results : [];
+    const entry = results[state.viewer.index];
+    return entry && entry.path ? entry.path : null;
+  }
+  if (state.viewer.mode === "group") {
+    const groupState = state.groups.get(state.viewer.groupKey);
+    if (!groupState) {
+      return null;
+    }
+    const entry = groupState.images[state.viewer.index];
+    return entry && entry.path ? entry.path : null;
+  }
+  return null;
+}
+
+function rememberPreloadedViewerImage(path, record) {
+  if (!path || !record) {
+    return;
+  }
+  if (state.viewer.preloadCache.has(path)) {
+    state.viewer.preloadCache.delete(path);
+  }
+  state.viewer.preloadCache.set(path, record);
+  while (state.viewer.preloadCache.size > VIEWER_PRELOAD_CACHE_LIMIT) {
+    const oldestKey = state.viewer.preloadCache.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    state.viewer.preloadCache.delete(oldestKey);
+  }
+}
+
+function preloadViewerImage(path) {
+  if (!path) {
+    return Promise.resolve(null);
+  }
+  const cached = state.viewer.preloadCache.get(path);
+  if (cached && cached.promise) {
+    return cached.promise;
+  }
+  const src = `/api/image?path=${encodeURIComponent(path)}`;
+  const image = new Image();
+  const promise = new Promise((resolve) => {
+    image.onload = () => resolve({ path, ok: true });
+    image.onerror = () => resolve({ path, ok: false });
+  });
+  image.src = src;
+  rememberPreloadedViewerImage(path, { image, promise });
+  state.viewer.debug.cacheSize = state.viewer.preloadCache.size;
+  renderViewerDebugPanel();
+  return promise;
+}
+
+async function resolveVectorAdjacentTarget(direction, { wrap = true } = {}) {
+  const results = Array.isArray(state.vectorView.results) ? state.vectorView.results : [];
+  if (!results.length || state.viewer.index < 0) {
+    return null;
+  }
+  const total = results.length;
+  let nextIndex = state.viewer.index + (direction >= 0 ? 1 : -1);
+  if (wrap) {
+    nextIndex = ((nextIndex % total) + total) % total;
+  } else if (nextIndex < 0 || nextIndex >= total) {
+    return null;
+  }
+  const item = results[nextIndex];
+  if (!item || !item.path) {
+    return null;
+  }
+  return { mode: "vector", index: nextIndex, path: item.path };
+}
+
+async function resolveGroupAdjacentTarget(direction, { wrap = true } = {}) {
+  const groupKey = state.viewer.groupKey;
+  if (!groupKey || state.viewer.index < 0) {
+    return null;
+  }
+  const currentGroup = state.groups.get(groupKey);
+  if (!currentGroup) {
+    return null;
+  }
+  const step = direction >= 0 ? 1 : -1;
+  const currentManifest = currentGroup.manifest || state.imagesByGroup.get(groupKey) || [];
+
+  if (step > 0) {
+    await ensureGroupManifestCount(currentGroup, state.viewer.index + 2, { force: true });
+    const nextItem = currentManifest[state.viewer.index + 1];
+    if (nextItem && nextItem.path) {
+      const nextIndex = await ensureImageLoaded(nextItem.path, groupKey);
+      if (nextIndex !== -1) {
+        return { mode: "group", groupKey, index: nextIndex, path: nextItem.path };
+      }
+    }
+  } else if (state.viewer.index > 0) {
+    const prevItem = currentManifest[state.viewer.index - 1];
+    if (prevItem && prevItem.path) {
+      const prevIndex = await ensureImageLoaded(prevItem.path, groupKey);
+      if (prevIndex !== -1) {
+        return { mode: "group", groupKey, index: prevIndex, path: prevItem.path };
+      }
+    }
+  }
+
+  const sequence = state.groupSequence;
+  const startIndex = state.groupIndexMap.get(groupKey);
+  if (startIndex === undefined || !sequence.length) {
+    return null;
+  }
+
+  for (let offset = 1; offset <= sequence.length; offset += 1) {
+    let sequenceIndex = startIndex + (offset * step);
+    if (wrap) {
+      sequenceIndex = ((sequenceIndex % sequence.length) + sequence.length) % sequence.length;
+    } else if (sequenceIndex < 0 || sequenceIndex >= sequence.length) {
+      break;
+    }
+    const candidateGroupKey = sequence[sequenceIndex];
+    const candidateGroup = state.groups.get(candidateGroupKey);
+    if (!candidateGroup || candidateGroup.total === 0) {
+      continue;
+    }
+
+    if (step > 0) {
+      await ensureGroupManifestCount(candidateGroup, 1, { force: true });
+      const manifest = candidateGroup.manifest || state.imagesByGroup.get(candidateGroupKey) || [];
+      const firstItem = manifest[0];
+      if (!firstItem || !firstItem.path) {
+        continue;
+      }
+      const firstIndex = await ensureImageLoaded(firstItem.path, candidateGroupKey);
+      if (firstIndex !== -1) {
+        return {
+          mode: "group",
+          groupKey: candidateGroupKey,
+          index: firstIndex,
+          path: firstItem.path,
+        };
+      }
+      continue;
+    }
+
+    await ensureGroupManifestCount(candidateGroup, candidateGroup.total, { force: true });
+    const manifest = candidateGroup.manifest || state.imagesByGroup.get(candidateGroupKey) || [];
+    const lastItem = manifest[manifest.length - 1];
+    if (!lastItem || !lastItem.path) {
+      continue;
+    }
+    const lastIndex = await ensureImageLoaded(lastItem.path, candidateGroupKey);
+    if (lastIndex !== -1) {
+      return {
+        mode: "group",
+        groupKey: candidateGroupKey,
+        index: lastIndex,
+        path: lastItem.path,
+      };
+    }
+  }
+  return null;
+}
+
+async function resolveAdjacentViewerTarget(direction, options = {}) {
+  if (!state.viewer.open) {
+    return null;
+  }
+  if (state.viewer.mode === "group") {
+    return resolveGroupAdjacentTarget(direction, options);
+  }
+  return null;
+}
+
+function openResolvedViewerTarget(target) {
+  if (!target) {
+    return;
+  }
+  state.viewer.pendingBlend = 0;
+  if (target.mode === "vector") {
+    openVectorViewerAt(target.index);
+    return;
+  }
+  if (target.mode === "group") {
+    openViewerAt(target.groupKey, target.index);
+  }
+}
+
+async function preloadAdjacentViewerTargets() {
+  if (!state.viewer.open) {
+    return;
+  }
+  if (state.viewer.mode !== "group") {
+    return;
+  }
+  state.viewer.debug.status = "resolving adjacent images";
+  renderViewerDebugPanel();
+  const token = Symbol("viewerPreload");
+  state.viewer.preloadToken = token;
+  const [nextTarget, prevTarget] = await Promise.all([
+    resolveAdjacentViewerTarget(1, { wrap: true }),
+    resolveAdjacentViewerTarget(-1, { wrap: true }),
+  ]);
+  if (!state.viewer.open || state.viewer.preloadToken !== token) {
+    return;
+  }
+  state.viewer.debug.nextPath = nextTarget && nextTarget.path ? nextTarget.path : null;
+  state.viewer.debug.prevPath = prevTarget && prevTarget.path ? prevTarget.path : null;
+  const currentPath = getCurrentViewerPath();
+  const toPreload = [nextTarget && nextTarget.path, prevTarget && prevTarget.path]
+    .filter((path) => path && path !== currentPath);
+  const deduped = Array.from(new Set(toPreload));
+  state.viewer.debug.status = deduped.length ? "preloading adjacent images" : "no adjacent image";
+  renderViewerDebugPanel();
+  await Promise.all(deduped.map((path) => preloadViewerImage(path)));
+  if (!state.viewer.open || state.viewer.preloadToken !== token) {
+    return;
+  }
+  state.viewer.debug.cacheSize = state.viewer.preloadCache.size;
+  state.viewer.debug.status = "ready";
+  renderViewerDebugPanel();
+}
+
 function updateUrlWithImage(path) {
   const params = new URLSearchParams(window.location.search);
   if (path) {
@@ -3536,6 +4007,7 @@ function openViewerAt(groupKey, index) {
       elements.header.classList.add("viewer-hidden");
     }
   }
+  applyViewerModePresentation();
   const blendDuration = Math.max(0, Number(state.viewer.pendingBlend) || 0);
   showViewerLoading(blendDuration);
   updateUrlWithImage(targetItem.path);
@@ -3569,6 +4041,7 @@ function openVectorViewerAt(index) {
   if (elements.header) {
     elements.header.classList.add("viewer-hidden");
   }
+  applyViewerModePresentation();
   const blendDuration = Math.max(0, Number(state.viewer.pendingBlend) || 0);
   showViewerLoading(blendDuration);
   updateUrlWithImage(path);
@@ -3582,8 +4055,31 @@ function closeViewer() {
   state.viewer.index = -1;
   state.viewer.vectorPaths = [];
   state.viewer.detailsPath = null;
+  state.viewer.preloadToken = null;
+  if (!state.viewer.preloadCache || typeof state.viewer.preloadCache.clear !== "function") {
+    state.viewer.preloadCache = new Map();
+  } else {
+    state.viewer.preloadCache.clear();
+  }
+  if (!state.viewer.debug || typeof state.viewer.debug !== "object") {
+    state.viewer.debug = {
+      enabled: false,
+      currentPath: null,
+      nextPath: null,
+      prevPath: null,
+      cacheSize: 0,
+      status: "idle",
+    };
+  } else {
+    state.viewer.debug.currentPath = null;
+    state.viewer.debug.nextPath = null;
+    state.viewer.debug.prevPath = null;
+    state.viewer.debug.cacheSize = 0;
+    state.viewer.debug.status = "idle";
+  }
   elements.viewerOverlay.hidden = true;
   document.body.classList.remove("viewer-open");
+  applyViewerModePresentation();
   if (elements.header) {
     elements.header.classList.remove("viewer-hidden");
     if (!state.controlOpen && !headerHover) {
@@ -3640,6 +4136,9 @@ function renderViewer() {
   if (!path) {
     return;
   }
+  state.viewer.debug.currentPath = path;
+  state.viewer.debug.status = "loading current image";
+  renderViewerDebugPanel();
   const blendDuration = Math.max(0, Number(state.viewer.pendingBlend) || 0);
   state.viewer.pendingBlend = 0;
   prepareViewerTransition(blendDuration);
@@ -3688,10 +4187,17 @@ function renderViewer() {
       mainImage.removeEventListener("load", finalize);
       mainImage.removeEventListener("error", handleError);
     }
+    state.viewer.debug.status = "rendered";
+    renderViewerDebugPanel();
+    preloadAdjacentViewerTargets().catch((error) => {
+      console.warn("Viewer preload failed", error);
+      state.viewer.debug.status = "preload error";
+      renderViewerDebugPanel();
+    });
   };
   const handleError = () => {
     setInfoBar(elements.viewerInfoTop, "Failed to load image", "block");
-    setInfoBar(elements.viewerInfoBottom, nameText || "", nameText ? "block" : "none");
+    setInfoBar(elements.viewerInfoBottom, "", "none");
     setInfoBar(elements.viewerInfoLeft, "", "block");
     setInfoBar(elements.viewerInfoRight, "", "block");
     if (!isVector) {
@@ -3710,15 +4216,20 @@ function renderViewer() {
       overlayImage.style.opacity = "0";
       overlayImage.hidden = true;
     }
+    state.viewer.debug.status = "load error";
+    renderViewerDebugPanel();
   };
   if (mainImage) {
     mainImage.addEventListener("load", finalize);
     mainImage.addEventListener("error", handleError);
   }
   if (isVector) {
-    const topText = labelText || nameText;
+    const topText = buildViewerTopInfoText({
+      dateText: labelText || "",
+      nameText,
+    });
     setInfoBar(elements.viewerInfoTop, topText, topText ? "block" : "none");
-    setInfoBar(elements.viewerInfoBottom, nameText, nameText ? "block" : "none");
+    setInfoBar(elements.viewerInfoBottom, "", "none");
     setInfoBar(elements.viewerInfoLeft, "", "block");
     setInfoBar(elements.viewerInfoRight, "", "block");
   }
@@ -3985,6 +4496,9 @@ function updateViewerDetails(item) {
 }
 
 function setViewerDetailsVisibility(open) {
+  if (open && !isViewerDetailsEnabledForMode()) {
+    return;
+  }
   state.viewer.detailsOpen = Boolean(open);
   if (elements.viewerDetailsPanel) {
     elements.viewerDetailsPanel.hidden = !state.viewer.detailsOpen;
@@ -3996,10 +4510,11 @@ function setViewerDetailsVisibility(open) {
     return;
   }
   updateViewerDetails({ path: state.viewer.detailsPath });
+  applyViewerModePresentation();
 }
 
 function handleViewerDoubleClick(event) {
-  if (!state.viewer.open) {
+  if (!state.viewer.open || !isViewerDetailsEnabledForMode()) {
     return;
   }
   event.preventDefault();
@@ -4036,12 +4551,25 @@ function showViewerLoading(blendDuration = 0) {
     elements.viewerImageOverlay.hidden = true;
   }
   setInfoBar(elements.viewerInfoTop, "Loading image…", "block");
-  setInfoBar(elements.viewerInfoBottom, "", "block");
+  setInfoBar(elements.viewerInfoBottom, "", "none");
   setInfoBar(elements.viewerInfoLeft, "", "block");
   setInfoBar(elements.viewerInfoRight, "", "block");
   if (state.viewer.detailsOpen) {
     showViewerDetailsLoading();
   }
+}
+
+function buildViewerTopInfoText({ dateText = "", nameText = "", locationText = "" } = {}) {
+  const parts = [];
+  if (dateText) {
+    parts.push(dateText);
+  }
+  if (nameText) {
+    parts.push(nameText);
+  } else if (locationText) {
+    parts.push(locationText);
+  }
+  return parts.join("  •  ");
 }
 
 function updateViewerMetadata(groupState, item) {
@@ -4051,28 +4579,23 @@ function updateViewerMetadata(groupState, item) {
   const location = item.path ? item.path.split("/").slice(0, -1).join("/") : "";
   const image = elements.viewerImage;
   resetViewerTransform();
+  const topText = buildViewerTopInfoText({
+    dateText,
+    nameText,
+    locationText: location,
+  });
   if (!image || !elements.viewerContainer) {
-    setInfoBar(elements.viewerInfoTop, dateText, dateText ? "block" : "none");
-    setInfoBar(elements.viewerInfoBottom, nameText, nameText ? "block" : "none");
+    setInfoBar(elements.viewerInfoTop, topText, topText ? "block" : "none");
+    setInfoBar(elements.viewerInfoBottom, "", "none");
     setInfoBar(elements.viewerInfoLeft, "", "block");
     setInfoBar(elements.viewerInfoRight, "", "block");
     return;
   }
-  const isPortrait = image.naturalHeight > image.naturalWidth;
-  elements.viewerContainer.classList.toggle("portrait", isPortrait);
-  if (isPortrait) {
-    setInfoBar(elements.viewerInfoTop, "", "block");
-    setInfoBar(elements.viewerInfoBottom, "", "block");
-    setInfoBar(elements.viewerInfoLeft, dateText, dateText ? "block" : "none");
-    const rightText = nameText || location;
-    setInfoBar(elements.viewerInfoRight, rightText, rightText ? "block" : "none");
-  } else {
-    const topText = dateText || location;
-    setInfoBar(elements.viewerInfoTop, topText, topText ? "block" : "none");
-    setInfoBar(elements.viewerInfoBottom, nameText, nameText ? "block" : "none");
-    setInfoBar(elements.viewerInfoLeft, "", "block");
-    setInfoBar(elements.viewerInfoRight, "", "block");
-  }
+  elements.viewerContainer.classList.remove("portrait");
+  setInfoBar(elements.viewerInfoTop, topText, topText ? "block" : "none");
+  setInfoBar(elements.viewerInfoBottom, "", "none");
+  setInfoBar(elements.viewerInfoLeft, "", "block");
+  setInfoBar(elements.viewerInfoRight, "", "block");
 }
 
 async function showNext() {
@@ -4088,50 +4611,8 @@ async function showNext() {
     }
     return;
   }
-  if (state.viewer.mode !== "group") {
-    return;
-  }
-  const currentGroup = state.groups.get(state.viewer.groupKey);
-  if (!currentGroup) {
-    return;
-  }
-  const nextIndex = state.viewer.index + 1;
-  const currentManifest = currentGroup.manifest || state.imagesByGroup.get(currentGroup.key) || [];
-  if (nextIndex < currentGroup.images.length) {
-    const entry = currentGroup.images[nextIndex];
-    if (entry && entry.element) {
-      state.viewer.pendingBlend = 0;
-      openViewerAt(currentGroup.key, nextIndex);
-      return;
-    }
-    const manifestItem = currentManifest[nextIndex];
-    if (manifestItem && manifestItem.path) {
-      const resolvedIndex = await ensureImageLoaded(manifestItem.path, currentGroup.key);
-      if (resolvedIndex !== -1) {
-        state.viewer.pendingBlend = 0;
-        openViewerAt(currentGroup.key, resolvedIndex);
-        return;
-      }
-    }
-  }
-  const nextGroupKey = getAdjacentGroupKey(currentGroup.key, 1);
-  if (!nextGroupKey) {
-    return;
-  }
-  await ensureGroupLoaded(nextGroupKey, { force: true });
-  const nextGroup = state.groups.get(nextGroupKey);
-  if (!nextGroup) {
-    return;
-  }
-  const nextManifest = nextGroup.manifest || state.imagesByGroup.get(nextGroupKey) || [];
-  const target = nextManifest[0];
-  if (target && target.path) {
-    const resolvedIndex = await ensureImageLoaded(target.path, nextGroupKey);
-    if (resolvedIndex !== -1) {
-      state.viewer.pendingBlend = 0;
-      openViewerAt(nextGroupKey, resolvedIndex);
-    }
-  }
+  const target = await resolveAdjacentViewerTarget(1, { wrap: true });
+  openResolvedViewerTarget(target);
 }
 
 async function showPrevious() {
@@ -4146,53 +4627,8 @@ async function showPrevious() {
     }
     return;
   }
-  if (state.viewer.mode !== "group") {
-    return;
-  }
-  const currentGroup = state.groups.get(state.viewer.groupKey);
-  if (!currentGroup) {
-    return;
-  }
-  if (state.viewer.index > 0) {
-    const prevIndex = state.viewer.index - 1;
-    const entry = currentGroup.images[prevIndex];
-    if (entry && entry.element) {
-      state.viewer.pendingBlend = 0;
-      openViewerAt(currentGroup.key, prevIndex);
-      return;
-    }
-    const manifest = currentGroup.manifest || state.imagesByGroup.get(currentGroup.key) || [];
-    const manifestItem = manifest[prevIndex];
-    if (manifestItem && manifestItem.path) {
-      const resolvedIndex = await ensureImageLoaded(manifestItem.path, currentGroup.key);
-      if (resolvedIndex !== -1) {
-        state.viewer.pendingBlend = 0;
-        openViewerAt(currentGroup.key, resolvedIndex);
-        return;
-      }
-    }
-  }
-  const prevGroupKey = getAdjacentGroupKey(currentGroup.key, -1);
-  if (!prevGroupKey) {
-    return;
-  }
-  await ensureGroupLoaded(prevGroupKey, { force: true });
-  const prevGroup = state.groups.get(prevGroupKey);
-  if (!prevGroup) {
-    return;
-  }
-  const prevManifest = prevGroup.manifest || state.imagesByGroup.get(prevGroupKey) || [];
-  const lastIndex = prevManifest.length - 1;
-  if (lastIndex >= 0) {
-    const manifestItem = prevManifest[lastIndex];
-    if (manifestItem && manifestItem.path) {
-      const resolvedIndex = await ensureImageLoaded(manifestItem.path, prevGroupKey);
-      if (resolvedIndex !== -1) {
-        state.viewer.pendingBlend = 0;
-        openViewerAt(prevGroupKey, resolvedIndex);
-      }
-    }
-  }
+  const target = await resolveAdjacentViewerTarget(-1, { wrap: true });
+  openResolvedViewerTarget(target);
 }
 
 async function openImageByPath(path) {
@@ -4726,12 +5162,103 @@ elements.viewerNext.addEventListener("click", async (event) => {
 
 let viewerHammer = null;
 let viewerPanOffset = 0;
+let viewerPanActive = false;
+let viewerPanTargets = { next: null, prev: null };
+let viewerPanDisplayedDirection = 0;
 
 function resetViewerTransform() {
   if (elements.viewerImage) {
     elements.viewerImage.style.transition = "";
     elements.viewerImage.style.transform = "translateX(0)";
   }
+  if (elements.viewerImageOverlay) {
+    elements.viewerImageOverlay.style.transition = "";
+    elements.viewerImageOverlay.style.transform = "translateX(0)";
+  }
+}
+
+function shouldUseTouchSwipePreview() {
+  if (!state.viewer.open || state.viewer.mode !== "group" || state.randomViewer.running) {
+    return false;
+  }
+  const touchPoints = Number.isFinite(navigator.maxTouchPoints) ? navigator.maxTouchPoints : 0;
+  return touchPoints > 0;
+}
+
+async function primeSwipePreviewTargets() {
+  if (!shouldUseTouchSwipePreview()) {
+    viewerPanTargets = { next: null, prev: null };
+    return;
+  }
+  const [nextTarget, prevTarget] = await Promise.all([
+    resolveAdjacentViewerTarget(1, { wrap: true }),
+    resolveAdjacentViewerTarget(-1, { wrap: true }),
+  ]);
+  if (!viewerPanActive) {
+    return;
+  }
+  viewerPanTargets = { next: nextTarget, prev: prevTarget };
+}
+
+function showSwipePreviewForDirection(direction) {
+  if (!shouldUseTouchSwipePreview()) {
+    return false;
+  }
+  const overlay = elements.viewerImageOverlay;
+  if (!overlay) {
+    return false;
+  }
+  const target = direction > 0 ? viewerPanTargets.next : viewerPanTargets.prev;
+  if (!target || !target.path) {
+    return false;
+  }
+  const src = `/api/image?path=${encodeURIComponent(target.path)}`;
+  if (overlay.src !== src) {
+    overlay.src = src;
+    overlay.alt = target.path.split("/").pop() || "Adjacent image";
+  }
+  overlay.hidden = false;
+  overlay.style.opacity = "1";
+  overlay.style.transition = "none";
+  viewerPanDisplayedDirection = direction;
+  return true;
+}
+
+function updateSwipePreviewTransforms(offsetX) {
+  const main = elements.viewerImage;
+  const overlay = elements.viewerImageOverlay;
+  if (!main || !overlay) {
+    return;
+  }
+  const direction = offsetX < 0 ? 1 : offsetX > 0 ? -1 : 0;
+  if (direction === 0) {
+    main.style.transform = "translateX(0)";
+    return;
+  }
+  const hasPreview = showSwipePreviewForDirection(direction);
+  main.style.transform = `translateX(${offsetX}px)`;
+  if (!hasPreview) {
+    if (!overlay.hidden) {
+      overlay.hidden = true;
+      overlay.style.opacity = "0";
+    }
+    return;
+  }
+  const width = Math.max(1, elements.viewerContainer ? elements.viewerContainer.clientWidth : window.innerWidth);
+  const startX = direction > 0 ? width : -width;
+  overlay.style.transform = `translateX(${startX + offsetX}px)`;
+}
+
+function clearSwipePreview() {
+  const overlay = elements.viewerImageOverlay;
+  if (!overlay) {
+    return;
+  }
+  overlay.style.transform = "translateX(0)";
+  overlay.style.transition = "";
+  overlay.style.opacity = "0";
+  overlay.hidden = true;
+  viewerPanDisplayedDirection = 0;
 }
 
 function setupViewerGestures() {
@@ -4750,13 +5277,24 @@ function setupViewerGestures() {
 
   viewerHammer.on("panstart", () => {
     viewerPanOffset = 0;
+    viewerPanActive = true;
+    viewerPanTargets = { next: null, prev: null };
+    viewerPanDisplayedDirection = 0;
     if (elements.viewerImage) {
       elements.viewerImage.style.transition = "none";
     }
+    if (elements.viewerImageOverlay) {
+      elements.viewerImageOverlay.style.transition = "none";
+    }
+    primeSwipePreviewTargets().catch(() => {});
   });
 
   viewerHammer.on("panmove", (ev) => {
     viewerPanOffset = ev.deltaX;
+    if (shouldUseTouchSwipePreview()) {
+      updateSwipePreviewTransforms(viewerPanOffset);
+      return;
+    }
     if (elements.viewerImage) {
       elements.viewerImage.style.transform = `translateX(${viewerPanOffset}px)`;
     }
@@ -4764,23 +5302,52 @@ function setupViewerGestures() {
 
   viewerHammer.on("panend pancancel", async () => {
     if (!elements.viewerImage) {
+      viewerPanActive = false;
       return;
     }
     const threshold = 150;
+    const usePreview = shouldUseTouchSwipePreview();
+    const overlay = elements.viewerImageOverlay;
+    const width = Math.max(1, elements.viewerContainer ? elements.viewerContainer.clientWidth : window.innerWidth);
     elements.viewerImage.style.transition = "transform 220ms ease";
+    if (usePreview && overlay) {
+      overlay.style.transition = "transform 220ms ease";
+    }
     if (viewerPanOffset <= -threshold) {
-      elements.viewerImage.style.transform = "translateX(-120%)";
+      if (usePreview && overlay && !overlay.hidden) {
+        elements.viewerImage.style.transform = `translateX(${-width}px)`;
+        overlay.style.transform = "translateX(0)";
+      } else {
+        elements.viewerImage.style.transform = "translateX(-120%)";
+      }
       setTimeout(async () => {
+        viewerPanActive = false;
+        clearSwipePreview();
         resetViewerTransform();
         await showNext();
-      }, 200);
+      }, 220);
     } else if (viewerPanOffset >= threshold) {
-      elements.viewerImage.style.transform = "translateX(120%)";
+      if (usePreview && overlay && !overlay.hidden) {
+        elements.viewerImage.style.transform = `translateX(${width}px)`;
+        overlay.style.transform = "translateX(0)";
+      } else {
+        elements.viewerImage.style.transform = "translateX(120%)";
+      }
       setTimeout(async () => {
+        viewerPanActive = false;
+        clearSwipePreview();
         resetViewerTransform();
         await showPrevious();
-      }, 200);
+      }, 220);
     } else {
+      if (usePreview && overlay && !overlay.hidden) {
+        const resetStartX = viewerPanDisplayedDirection > 0 ? width : -width;
+        overlay.style.transform = `translateX(${resetStartX}px)`;
+      }
+      viewerPanActive = false;
+      setTimeout(() => {
+        clearSwipePreview();
+      }, 220);
       resetViewerTransform();
     }
   });
@@ -4797,6 +5364,9 @@ function setupViewerGestures() {
 
   viewerHammer.on("tap", (ev) => {
     if (!state.viewer.open) {
+      return;
+    }
+    if (!isViewerDetailsEnabledForMode()) {
       return;
     }
     const target = ev.target;
@@ -4981,10 +5551,16 @@ updateFlyoutPinUI();
 setActiveControlTab(state.activeControlTab);
 updateFlyoutBackdropState();
 updateSemanticReturnControl();
+setViewerDebugEnabled(readViewerDebugPreference());
 
 setupViewerGestures();
 
 document.addEventListener("keydown", async (event) => {
+  if (state.viewer.open && event.key && event.key.toLowerCase() === "d" && event.shiftKey) {
+    event.preventDefault();
+    setViewerDebugEnabled(!state.viewer.debug.enabled);
+    return;
+  }
   if (event.key === "Escape") {
     if (state.viewer.open) {
       closeViewer();
@@ -5018,6 +5594,9 @@ document.addEventListener("keydown", async (event) => {
 
 elements.viewerOverlay.addEventListener("click", (event) => {
   if (event.target === elements.viewerOverlay) {
+    if (!isViewerOverlayDismissEnabled()) {
+      return;
+    }
     closeViewer();
   }
 });
