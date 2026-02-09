@@ -1589,7 +1589,7 @@ function updateFlyoutPinUI() {
   }
 }
 
-function setFlyoutPinned(pinned) {
+function setFlyoutPinned(pinned, { collapseOnUnpin = false } = {}) {
   const normalized = Boolean(pinned);
   if (state.flyoutPinned === normalized) {
     if (normalized) {
@@ -1608,14 +1608,18 @@ function setFlyoutPinned(pinned) {
       openControlPanel();
     }
     setHeaderCollapsed(false);
-  } else if (!state.controlOpen && !headerHover) {
+  } else if (collapseOnUnpin) {
+    closeControlPanel();
     setHeaderCollapsed(true);
+  } else if (!state.controlOpen && !headerHover) {
+      setHeaderCollapsed(true);
   }
   updateFlyoutBackdropState();
 }
 
 function toggleFlyoutPin() {
-  setFlyoutPinned(!state.flyoutPinned);
+  const nextPinned = !state.flyoutPinned;
+  setFlyoutPinned(nextPinned, { collapseOnUnpin: !nextPinned });
 }
 
 function parseDateToValue(dateString) {
@@ -1929,7 +1933,12 @@ function displayRandomViewerImage(choice) {
   elements.viewerOverlay.hidden = false;
   document.body.classList.add("viewer-open");
   if (elements.header) {
-    elements.header.classList.add("viewer-hidden");
+    if (state.flyoutPinned || state.controlOpen) {
+      elements.header.classList.remove("viewer-hidden");
+      setHeaderCollapsed(false);
+    } else {
+      elements.header.classList.add("viewer-hidden");
+    }
   }
   prepareViewerTransition(blendDuration);
   showViewerLoading(blendDuration);
@@ -3552,7 +3561,12 @@ function openViewerAt(groupKey, index) {
   elements.viewerOverlay.hidden = false;
   document.body.classList.add("viewer-open");
   if (elements.header) {
-    elements.header.classList.add("viewer-hidden");
+    if (state.flyoutPinned || state.controlOpen) {
+      elements.header.classList.remove("viewer-hidden");
+      setHeaderCollapsed(false);
+    } else {
+      elements.header.classList.add("viewer-hidden");
+    }
   }
   const blendDuration = Math.max(0, Number(state.viewer.pendingBlend) || 0);
   showViewerLoading(blendDuration);
@@ -4710,11 +4724,13 @@ if (elements.randomViewerSpecificInput) {
 if (elements.flyoutPin) {
   elements.flyoutPin.addEventListener("click", (event) => {
     event.preventDefault();
+    event.stopPropagation();
     toggleFlyoutPin();
   });
   elements.flyoutPin.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
+      event.stopPropagation();
       toggleFlyoutPin();
     }
   });
