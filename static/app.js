@@ -3328,7 +3328,7 @@ function loadVisibleGroups() {
       return;
     }
     const rect = entry.container.getBoundingClientRect();
-    if (rect.bottom < viewport.top - margin || rect.top > viewport.bottom + margin) {
+    if (rect.bottom < viewport.top || rect.top > viewport.bottom + margin) {
       return;
     }
     visibleKeys.push(key);
@@ -3358,11 +3358,7 @@ function loadVisibleGroups() {
       });
     }
   });
-  const firstIndex = state.groupIndexMap.get(visibleKeys[0]);
   const lastIndex = state.groupIndexMap.get(visibleKeys[visibleKeys.length - 1]);
-  if (firstIndex !== undefined && firstIndex > 0) {
-    ensureGroupLoaded(state.groupSequence[firstIndex - 1]).catch((error) => console.error(error));
-  }
   if (lastIndex !== undefined && lastIndex + 1 < state.groupSequence.length) {
     ensureGroupLoaded(state.groupSequence[lastIndex + 1]).catch((error) => console.error(error));
   }
@@ -3371,7 +3367,7 @@ function loadVisibleGroups() {
       return;
     }
     const rect = meta.section.getBoundingClientRect();
-    if (rect.bottom < viewport.top - margin || rect.top > viewport.bottom + margin) {
+    if (rect.bottom < viewport.top || rect.top > viewport.bottom + margin) {
       return;
     }
     maybeRenderMoreSubgroups(meta, viewport, margin);
@@ -4530,7 +4526,10 @@ if (elements.yearNavigationSelect) {
     if (!topKey) {
       return;
     }
-    navigateToTopGroup(topKey);
+    showTimelineView();
+    requestAnimationFrame(() => {
+      navigateToTopGroup(topKey);
+    });
     event.target.selectedIndex = 0;
     closeControlPanel();
   });

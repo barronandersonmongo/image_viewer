@@ -1,1 +1,1 @@
-{"semantic_score_cutoff": 0.56, "vector_sort": "date", "vector_sort_date_direction": "asc", "vector_sort_score_direction": "desc"}
+{"semantic_score_cutoff": 0.56, "vector_sort_score_direction": "desc", "vector_sort_date_direction": "asc", "vector_sort": "date"}
