@@ -42,6 +42,11 @@ const MONTH_ABBREVIATIONS = [
 ];
 
 const CONTROL_TABS = ["search", "year", "random"];
+const STORAGE_KEYS = {
+  semanticScoreCutoff: "barryImageViewer.semanticScoreCutoff",
+};
+const STORAGE_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
+let semanticScoreSyncTimer = null;
 
 const state = {
   order: initialOrder,
@@ -167,7 +172,7 @@ const elements = {
   searchScoreInput: document.getElementById("searchScoreInput"),
   searchScoreValue: document.getElementById("searchScoreValue"),
   orderSwitch: document.getElementById("orderSwitch"),
-  orderToggle: document.getElementById("orderToggle"),
+  orderButtons: Array.from(document.querySelectorAll(".order-option")),
   yearNavigation: document.getElementById("yearNavigation"),
   yearNavigationButtons: document.getElementById("yearNavigationButtons"),
   yearNavigationSelect: document.getElementById("yearNavigationSelect"),
@@ -265,6 +270,86 @@ function getSemanticScoreDefault() {
   return Math.max(0, Math.min(1, state.appConfig.semanticScoreDefault));
 }
 
+function getPersistedSemanticScoreCutoff() {
+  let storageValue = null;
+  const cookiePrefix = `${encodeURIComponent(STORAGE_KEYS.semanticScoreCutoff)}=`;
+  const cookieValue = document.cookie
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(cookiePrefix));
+  if (cookieValue) {
+    storageValue = decodeURIComponent(cookieValue.slice(cookiePrefix.length));
+  }
+
+  try {
+    const localValue = window.localStorage.getItem(STORAGE_KEYS.semanticScoreCutoff);
+    if (storageValue === null && localValue !== null) {
+      storageValue = localValue;
+    }
+  } catch (error) {
+    // Continue with cookie value if localStorage is unavailable.
+  }
+
+  if (storageValue === null) {
+    return null;
+  }
+  const parsed = Number.parseFloat(storageValue);
+  if (Number.isNaN(parsed)) {
+    return null;
+  }
+  return Math.max(0, Math.min(1, parsed));
+}
+
+function persistSemanticScoreCutoff(value) {
+  const normalized = Math.max(0, Math.min(1, value)).toFixed(2);
+  try {
+    window.localStorage.setItem(
+      STORAGE_KEYS.semanticScoreCutoff,
+      normalized,
+    );
+  } catch (error) {
+    // Fall back to cookie-based persistence if localStorage is blocked.
+  }
+  document.cookie = `${encodeURIComponent(STORAGE_KEYS.semanticScoreCutoff)}=${encodeURIComponent(normalized)}; path=/; max-age=${STORAGE_COOKIE_MAX_AGE}; samesite=lax`;
+}
+
+async function saveSemanticScoreCutoffToServer(value) {
+  const normalized = Math.max(0, Math.min(1, value));
+  const response = await fetch("/api/ui-state", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ semantic_score_cutoff: normalized }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to persist slider value (${response.status})`);
+  }
+}
+
+function queueSemanticScoreCutoffSync(value) {
+  if (semanticScoreSyncTimer) {
+    clearTimeout(semanticScoreSyncTimer);
+  }
+  semanticScoreSyncTimer = setTimeout(() => {
+    saveSemanticScoreCutoffToServer(value).catch((error) => {
+      console.error("Failed to sync semantic score cutoff", error);
+    });
+    semanticScoreSyncTimer = null;
+  }, 250);
+}
+
+function flushSemanticScoreCutoffToServer(value) {
+  const normalized = Math.max(0, Math.min(1, value));
+  const payload = JSON.stringify({ semantic_score_cutoff: normalized });
+  if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+    const blob = new Blob([payload], { type: "application/json" });
+    navigator.sendBeacon("/api/ui-state", blob);
+    return;
+  }
+  saveSemanticScoreCutoffToServer(normalized).catch(() => {});
+}
+
 function getSemanticScoreCutoff() {
   const fallback = getSemanticScoreDefault();
   if (!elements.searchScoreInput) {
@@ -289,8 +374,10 @@ function applySemanticScoreDefault() {
   if (!elements.searchScoreInput) {
     return;
   }
-  const value = getSemanticScoreDefault();
+  const persisted = getPersistedSemanticScoreCutoff();
+  const value = typeof persisted === "number" ? persisted : getSemanticScoreDefault();
   elements.searchScoreInput.value = value.toFixed(2);
+  persistSemanticScoreCutoff(value);
   updateSemanticScoreLabel();
 }
 
@@ -304,6 +391,25 @@ async function loadAppConfigDefaults() {
     return;
   }
   applySemanticScoreDefault();
+}
+
+async function loadSemanticScoreCutoffFromServer() {
+  if (!elements.searchScoreInput) {
+    return;
+  }
+  try {
+    const payload = await fetchJson("/api/ui-state");
+    const raw = payload ? Number.parseFloat(payload.semantic_score_cutoff) : Number.NaN;
+    if (Number.isNaN(raw)) {
+      return;
+    }
+    const normalized = Math.max(0, Math.min(1, raw));
+    elements.searchScoreInput.value = normalized.toFixed(2);
+    persistSemanticScoreCutoff(normalized);
+    updateSemanticScoreLabel();
+  } catch (error) {
+    // Non-fatal; local defaults are already applied.
+  }
 }
 
 function setGlobalLoaderVisible(visible) {
@@ -1479,7 +1585,7 @@ function updateFlyoutPinUI() {
   );
   const textSpan = elements.flyoutPin.querySelector(".pin-text");
   if (textSpan) {
-    textSpan.textContent = state.flyoutPinned ? "Pinned" : "Pin";
+    textSpan.textContent = state.flyoutPinned ? "Pinned" : "Auto";
   }
 }
 
@@ -2651,12 +2757,19 @@ function closeControlPanel() {
 }
 
 function updateOrderUI() {
-  if (!elements.orderToggle || !elements.orderSwitch) {
+  if (!elements.orderSwitch) {
     return;
   }
-  elements.orderToggle.checked = state.order === "asc";
-  elements.orderToggle.setAttribute("aria-checked", state.order === "asc" ? "true" : "false");
   elements.orderSwitch.classList.toggle("asc", state.order === "asc");
+  if (Array.isArray(elements.orderButtons)) {
+    elements.orderButtons.forEach((button) => {
+      const buttonOrder = button.dataset.order === "asc" ? "asc" : "desc";
+      const isActive = buttonOrder === state.order;
+      button.classList.toggle("active", isActive);
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+      button.tabIndex = isActive ? 0 : -1;
+    });
+  }
 }
 
 function resetStateForOrder() {
@@ -4471,6 +4584,15 @@ if (elements.searchForm) {
 
 if (elements.searchScoreInput) {
   elements.searchScoreInput.addEventListener("input", () => {
+    const value = getSemanticScoreCutoff();
+    persistSemanticScoreCutoff(value);
+    queueSemanticScoreCutoffSync(value);
+    updateSemanticScoreLabel();
+  });
+  elements.searchScoreInput.addEventListener("change", () => {
+    const value = getSemanticScoreCutoff();
+    persistSemanticScoreCutoff(value);
+    queueSemanticScoreCutoffSync(value);
     updateSemanticScoreLabel();
   });
 }
@@ -4598,24 +4720,16 @@ if (elements.flyoutPin) {
   });
 }
 
-if (elements.orderToggle) {
-  elements.orderToggle.addEventListener("change", () => {
-    const nextOrder = elements.orderToggle.checked ? "asc" : "desc";
-    applyOrder(nextOrder, { updateUrl: true });
-  });
-}
-
 if (elements.orderSwitch) {
   elements.orderSwitch.addEventListener("click", (event) => {
-    const textNode = event.target.closest(".order-text");
-    if (!textNode) {
+    const orderButton = event.target.closest(".order-option");
+    if (!orderButton) {
       return;
     }
-    const nextOrder = textNode.classList.contains("order-text-right") ? "asc" : "desc";
+    const nextOrder = orderButton.dataset.order === "asc" ? "asc" : "desc";
     if (nextOrder === state.order) {
       return;
     }
-    elements.orderToggle.checked = nextOrder === "asc";
     applyOrder(nextOrder, { updateUrl: true });
   });
 }
@@ -4965,11 +5079,30 @@ window.addEventListener("popstate", () => {
   }
 });
 
+window.addEventListener("beforeunload", () => {
+  if (!elements.searchScoreInput) {
+    return;
+  }
+  const value = getSemanticScoreCutoff();
+  persistSemanticScoreCutoff(value);
+  flushSemanticScoreCutoffToServer(value);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "hidden" || !elements.searchScoreInput) {
+    return;
+  }
+  const value = getSemanticScoreCutoff();
+  persistSemanticScoreCutoff(value);
+  flushSemanticScoreCutoffToServer(value);
+});
+
 function init() {
   updateOrderUI();
   updateSearchHistoryControls();
-  updateSemanticScoreLabel();
-  loadAppConfigDefaults();
+  applySemanticScoreDefault();
+  loadAppConfigDefaults()
+    .finally(() => loadSemanticScoreCutoffFromServer());
   if (elements.controlContent) {
     elements.controlContent.setAttribute("aria-hidden", "true");
   }

@@ -13,27 +13,22 @@
   <div id="app">
     <header class="app-header collapsed" id="appHeader">
       <div class="header-bar">
-        <h1>Barry Image Viewer</h1>
         <div class="header-controls">
-          <div class="order-switch" id="orderSwitch">
-            <span class="order-text order-text-left">Newest first</span>
-            <label class="order-toggle">
-              <input type="checkbox" id="orderToggle" aria-label="Toggle sort order">
-              <span class="order-slider"><span class="order-handle"></span></span>
-            </label>
-            <span class="order-text order-text-right">Oldest first</span>
+          <div class="order-switch" id="orderSwitch" role="group" aria-label="Sort order">
+            <button type="button" class="order-option active" data-order="desc" aria-pressed="true">Newest</button>
+            <button type="button" class="order-option" data-order="asc" aria-pressed="false">Oldest</button>
           </div>
           <button type="button" class="flyout-pin" id="flyoutPin" aria-pressed="false" aria-label="Pin controls">
-            <span class="pin-icon" aria-hidden="true">📌</span>
-            <span class="pin-text">Pin</span>
+            <span class="pin-indicator" aria-hidden="true"></span>
+            <span class="pin-text">Auto</span>
           </button>
         </div>
       </div>
       <div class="control-content" id="controlContent" aria-hidden="true">
         <div class="control-tabs" role="tablist">
           <button type="button" class="control-tab active" data-tab="search" id="tabButtonSearch" role="tab" aria-selected="true" aria-controls="controlPanelSearch">Search</button>
-          <button type="button" class="control-tab" data-tab="year" id="tabButtonYear" role="tab" aria-selected="false" aria-controls="controlPanelYear">Jump to Year</button>
-          <button type="button" class="control-tab" data-tab="random" id="tabButtonRandom" role="tab" aria-selected="false" aria-controls="controlPanelRandom">Random Viewer</button>
+          <button type="button" class="control-tab" data-tab="year" id="tabButtonYear" role="tab" aria-selected="false" aria-controls="controlPanelYear">Year</button>
+          <button type="button" class="control-tab" data-tab="random" id="tabButtonRandom" role="tab" aria-selected="false" aria-controls="controlPanelRandom">Random</button>
         </div>
         <section class="control-panel" id="controlPanelSearch" role="tabpanel" aria-labelledby="tabButtonSearch">
           <form id="searchForm" class="search-form">
@@ -175,6 +170,6 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
-  <script src="app.js?v=22"></script>
+  <script src="app.js?v=25"></script>
 </body>
 </html>

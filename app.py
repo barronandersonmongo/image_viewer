@@ -8,6 +8,7 @@ import json
 import logging
 import logging.handlers
 import mimetypes
+import threading
 import zipfile
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -74,6 +75,39 @@ HIERARCHY_SERVICE = HierarchyService(IMAGE_REPOSITORY)
 MONGO_CLIENT: Optional["MongoClient"] = None
 VOYAGE_CLIENT: Optional["VoyageClient"] = None
 LOGGER = logging.getLogger("barry_image_viewer")
+UI_STATE_PATH = STATIC_DIR / ".ui_state.json"
+UI_STATE_LOCK = threading.Lock()
+UI_STATE_ALLOWED_KEYS = {"semantic_score_cutoff"}
+
+
+def _read_ui_state_unlocked() -> Dict[str, object]:
+    if not UI_STATE_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {key: payload[key] for key in UI_STATE_ALLOWED_KEYS if key in payload}
+
+
+def read_ui_state() -> Dict[str, object]:
+    with UI_STATE_LOCK:
+        return _read_ui_state_unlocked()
+
+
+def write_ui_state(update: Dict[str, object]) -> Dict[str, object]:
+    with UI_STATE_LOCK:
+        current = _read_ui_state_unlocked()
+        for key, value in update.items():
+            if key in UI_STATE_ALLOWED_KEYS:
+                current[key] = value
+        try:
+            UI_STATE_PATH.write_text(json.dumps(current, ensure_ascii=True), encoding="utf-8")
+        except OSError:
+            return current
+        return current
 
 
 class JsonFormatter(logging.Formatter):
@@ -205,6 +239,9 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         if parsed.path == "/api/images-by-dates":
             self.api_images_by_dates()
             return
+        if parsed.path == "/api/ui-state":
+            self.api_ui_state_update()
+            return
         self.send_error(HTTPStatus.METHOD_NOT_ALLOWED, "Unsupported POST endpoint")
 
     # API handlers -----------------------------------------------------
@@ -240,6 +277,8 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.api_timeline(params)
             elif route == "/api/holiday-dates":
                 self.api_holiday_dates(params)
+            elif route == "/api/ui-state":
+                self.api_ui_state()
             else:
                 self.send_json({"error": "Unknown endpoint"}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:
@@ -505,6 +544,42 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         )
         records = self.holiday_repository.resolve_records(names)
         self.send_json({"results": records})
+
+    def api_ui_state(self) -> None:
+        self.send_json(read_ui_state())
+
+    def api_ui_state_update(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self.send_json({"error": "Invalid Content-Length"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if length <= 0:
+            self.send_json({"error": "Request body required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            payload_raw = self.rfile.read(length)
+            payload = json.loads(payload_raw.decode("utf-8"))
+        except Exception:
+            self.send_json({"error": "Invalid JSON payload"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if not isinstance(payload, dict):
+            self.send_json({"error": "Payload must be an object"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        update: Dict[str, object] = {}
+        if "semantic_score_cutoff" in payload:
+            try:
+                value = float(payload["semantic_score_cutoff"])
+            except (TypeError, ValueError):
+                self.send_json({"error": "semantic_score_cutoff must be numeric"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            update["semantic_score_cutoff"] = max(0.0, min(1.0, value))
+
+        if not update:
+            self.send_json({"error": "No supported fields provided"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self.send_json(write_ui_state(update))
 
     def api_images_by_dates(self) -> None:
         try:
