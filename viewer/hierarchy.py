@@ -211,6 +211,48 @@ class HierarchyService:
 
         return {"images": response_images, "nextCursor": next_cursor}
 
+    def group_images_batch_payload(
+        self,
+        root: Path,
+        group_keys: Sequence[str],
+        order: str,
+    ) -> Dict[str, object]:
+        normalized = order.lower()
+        if normalized not in {"asc", "desc"}:
+            normalized = "desc"
+
+        deduped_keys: List[str] = []
+        seen = set()
+        for key in group_keys:
+            normalized_key = str(key).replace("\\", "/").strip()
+            if not normalized_key or normalized_key in seen:
+                continue
+            seen.add(normalized_key)
+            deduped_keys.append(normalized_key)
+
+        if not deduped_keys:
+            return {"groups": {}, "order": normalized}
+
+        if self.using_database:
+            return self._group_images_batch_payload_db(deduped_keys, normalized)
+
+        data = self.build(root)
+        grouped_images: Dict[str, List[Dict[str, object]]] = {}
+        for key in deduped_keys:
+            images = data["images_by_group"].get(key) or []
+            sequence = images if normalized == "desc" else list(reversed(images))
+            grouped_images[key] = [
+                {
+                    "name": item.get("name"),
+                    "path": item.get("path"),
+                    "dateHint": item.get("dateHint"),
+                    "dateValue": item.get("dateValue"),
+                }
+                for item in sequence
+                if item.get("path")
+            ]
+        return {"groups": grouped_images, "order": normalized}
+
     def sorted_image_paths(self, root: Path, order: str = "desc") -> List[str]:
         normalized = order if order in {"asc", "desc"} else "desc"
         if self.using_database:
@@ -757,3 +799,59 @@ class HierarchyService:
         ]
 
         return {"images": response_images, "nextCursor": next_cursor}
+
+    def _group_images_batch_payload_db(
+        self,
+        group_keys: Sequence[str],
+        order: str,
+    ) -> Dict[str, object]:
+        if not group_keys:
+            return {"groups": {}, "order": order}
+
+        sort_direction = -1 if order == "desc" else 1
+        documents = self.repository.aggregate_documents(
+            post_match={"subgroupKey": {"$in": list(group_keys)}},
+            sort_direction=sort_direction,
+        )
+        grouped_manifest: Dict[str, List[Dict[str, object]]] = {key: [] for key in group_keys}
+        for doc in documents:
+            relative = doc.get("relative") or relative_path_from_id(doc.get("_id"))
+            if not relative:
+                continue
+            rel_path = to_pure_posix(relative)
+            parts = rel_path.parts
+            subgroup_key = str(doc.get("subgroupKey") or "")
+            if not subgroup_key and len(parts) >= 2:
+                subgroup_key = f"{parts[0]}/{parts[1]}"
+            subgroup_key = subgroup_key.replace("\\", "/")
+            if subgroup_key not in grouped_manifest:
+                continue
+            subgroup_label = str(doc.get("subgroupLabel") or (parts[1] if len(parts) >= 2 else parts[0]))
+            manifest_entry, _has_date, _date_value = self._build_manifest_entry(rel_path, relative, subgroup_label, doc)
+            grouped_manifest[subgroup_key].append(manifest_entry)
+
+        grouped_images: Dict[str, List[Dict[str, object]]] = {}
+        for key in group_keys:
+            manifest = grouped_manifest.get(key, [])
+            manifest.sort(
+                key=lambda item: (
+                    1 if item.get("hasDate") else 0,
+                    item.get("dateValue", 0),
+                    (item.get("path") or "").lower(),
+                ),
+                reverse=True,
+            )
+            if order == "asc":
+                manifest = list(reversed(manifest))
+            grouped_images[key] = [
+                {
+                    "name": item.get("name"),
+                    "path": item.get("path"),
+                    "dateHint": item.get("dateHint"),
+                    "dateValue": item.get("dateValue"),
+                }
+                for item in manifest
+                if item.get("path")
+            ]
+
+        return {"groups": grouped_images, "order": order}

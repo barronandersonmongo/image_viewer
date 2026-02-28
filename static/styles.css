@@ -1324,6 +1324,38 @@ body.viewer-open {
   gap: 12px;
 }
 
+.thumbnail-slot {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 2px solid rgba(37, 99, 235, 0.14);
+  background: transparent;
+}
+
+.thumbnail-slot::before {
+  content: "";
+  display: block;
+  width: 100%;
+  padding-top: 75%;
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.22), rgba(59, 130, 246, 0.08));
+  position: relative;
+  overflow: hidden;
+}
+
+.thumbnail-slot::after {
+  content: "";
+  display: block;
+  min-height: 0.9rem;
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.12);
+  margin: 8px auto 0;
+  width: 70%;
+}
+
+.thumbnail-slot.placeholder::before {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.22), rgba(59, 130, 246, 0.08));
+}
+
 .thumbnail-button {
   position: relative;
   background: none;
@@ -1474,6 +1506,62 @@ body.viewer-open {
 
 .timeline-loader.visible {
   display: block;
+}
+
+.timeline-prealloc-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 360;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(2, 8, 23, 0.58);
+  backdrop-filter: blur(6px);
+}
+
+.timeline-prealloc-card {
+  width: min(560px, calc(100vw - 40px));
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.38);
+  background: linear-gradient(155deg, rgba(8, 15, 30, 0.96), rgba(14, 26, 49, 0.92));
+  box-shadow: 0 20px 44px rgba(2, 8, 23, 0.46);
+  padding: 18px 20px;
+}
+
+.timeline-prealloc-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: rgba(224, 236, 255, 0.96);
+}
+
+.timeline-prealloc-status {
+  margin: 8px 0 0;
+  color: rgba(191, 219, 254, 0.92);
+  font-size: 0.92rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-prealloc-bar {
+  margin-top: 12px;
+  height: 12px;
+  width: 100%;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.44);
+  background: rgba(15, 23, 42, 0.9);
+}
+
+.timeline-prealloc-fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #38bdf8, #60a5fa 55%, #3b82f6);
+  transition: width 0.18s ease;
 }
 
 .viewer-overlay {

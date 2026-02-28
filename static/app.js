@@ -2,6 +2,8 @@ const INITIAL_PREFETCH_GROUPS = 2;
 const GROUP_BATCH_SIZE = 3;
 const SUBGROUP_BATCH_SIZE = 6;
 const THUMBNAILS_PER_GROUP = 20;
+const INITIAL_PLACEHOLDERS_PER_GROUP = 16;
+const INITIAL_PLACEHOLDER_BUDGET = 320;
 const RANDOM_POOL_LIMIT = 2000;
 const SEARCH_HISTORY_LIMIT = 8;
 const VIEWER_PRELOAD_CACHE_LIMIT = 12;
@@ -128,6 +130,7 @@ const state = {
   },
   appConfig: {
     semanticScoreDefault: 0.75,
+    preallocProgressUpdateIntervalMs: 1000,
   },
   vectorView: {
     active: false,
@@ -144,12 +147,18 @@ const state = {
   },
   flyoutPinned: false,
   suppressThumbnailOpenUntil: 0,
+  startupPlaceholderBudgetRemaining: INITIAL_PLACEHOLDER_BUDGET,
 };
 
 const elements = {
   timeline: document.getElementById("timeline"),
   timelineSections: document.getElementById("timelineSections"),
   timelineLoader: document.getElementById("timelineLoader"),
+  timelinePreallocOverlay: document.getElementById("timelinePreallocOverlay"),
+  timelinePreallocTitle: document.getElementById("timelinePreallocTitle"),
+  timelinePreallocStatus: document.getElementById("timelinePreallocStatus"),
+  timelinePreallocBar: document.getElementById("timelinePreallocBar"),
+  timelinePreallocFill: document.getElementById("timelinePreallocFill"),
   semanticReturn: document.getElementById("semanticReturn"),
   semanticReturnLink: document.getElementById("semanticReturnLink"),
   flyoutHandle: document.getElementById("flyoutHandle"),
@@ -417,6 +426,15 @@ function getSemanticScoreDefault() {
   return Math.max(0, Math.min(1, state.appConfig.semanticScoreDefault));
 }
 
+function getPreallocProgressUpdateIntervalMs() {
+  const fallback = 1000;
+  if (!state.appConfig || typeof state.appConfig.preallocProgressUpdateIntervalMs !== "number") {
+    return fallback;
+  }
+  const value = Math.round(state.appConfig.preallocProgressUpdateIntervalMs);
+  return Math.max(100, value);
+}
+
 function getPersistedSemanticScoreCutoff() {
   let storageValue = null;
   const cookiePrefix = `${encodeURIComponent(STORAGE_KEYS.semanticScoreCutoff)}=`;
@@ -659,6 +677,9 @@ async function loadAppConfigDefaults() {
     if (config && typeof config.semantic_score_default === "number") {
       state.appConfig.semanticScoreDefault = config.semantic_score_default;
     }
+    if (config && typeof config.prealloc_progress_update_interval_ms === "number") {
+      state.appConfig.preallocProgressUpdateIntervalMs = config.prealloc_progress_update_interval_ms;
+    }
   } catch (error) {
     return;
   }
@@ -686,6 +707,66 @@ async function loadSemanticScoreCutoffFromServer() {
 
 function setGlobalLoaderVisible(visible) {
   elements.timelineLoader.classList.toggle("visible", visible);
+}
+
+function setPreallocationOverlayVisible(visible) {
+  if (!elements.timelinePreallocOverlay) {
+    return;
+  }
+  elements.timelinePreallocOverlay.hidden = !visible;
+}
+
+function updatePreallocationProgress(current, total, label = "Preparing year jump") {
+  const safeTotal = Math.max(0, Number.isFinite(total) ? total : 0);
+  const safeCurrent = Math.max(0, Math.min(safeTotal, Number.isFinite(current) ? current : 0));
+  const percent = safeTotal > 0 ? Math.min(100, Math.round((safeCurrent / safeTotal) * 100)) : 100;
+  if (elements.timelinePreallocTitle) {
+    elements.timelinePreallocTitle.textContent = label;
+  }
+  if (elements.timelinePreallocStatus) {
+    elements.timelinePreallocStatus.textContent = `${safeCurrent.toLocaleString()} / ${safeTotal.toLocaleString()} placeholders (${percent}%)`;
+  }
+  if (elements.timelinePreallocFill) {
+    elements.timelinePreallocFill.style.width = `${percent}%`;
+  }
+  if (elements.timelinePreallocBar) {
+    elements.timelinePreallocBar.setAttribute("aria-valuenow", String(percent));
+  }
+}
+
+function createYearJumpProgressTracker(startIndex, endIndex) {
+  const lower = Math.max(0, Math.min(startIndex, endIndex));
+  const upper = Math.min(state.topGroups.length - 1, Math.max(startIndex, endIndex));
+  const perGroupTotals = new Map();
+  let targetTotal = 0;
+  let currentTotal = 0;
+
+  for (let topIndex = lower; topIndex <= upper; topIndex += 1) {
+    const topGroup = state.topGroups[topIndex];
+    const subgroups = Array.isArray(topGroup && topGroup.subgroups) ? topGroup.subgroups : [];
+    for (let subgroupIndex = 0; subgroupIndex < subgroups.length; subgroupIndex += 1) {
+      const subgroup = subgroups[subgroupIndex];
+      if (!subgroup || !subgroup.key) {
+        continue;
+      }
+      const subgroupTotal = Math.max(0, Number.isFinite(subgroup.count) ? subgroup.count : 0);
+      perGroupTotals.set(subgroup.key, subgroupTotal);
+      targetTotal += subgroupTotal;
+      const existing = state.groups.get(subgroup.key);
+      if (existing) {
+        const existingCount = Math.max(0, Number.isFinite(existing.placeholderCount) ? existing.placeholderCount : 0);
+        currentTotal += Math.min(subgroupTotal, existingCount);
+      }
+    }
+  }
+
+  return {
+    lower,
+    upper,
+    perGroupTotals,
+    targetTotal,
+    currentTotal: Math.min(currentTotal, targetTotal),
+  };
 }
 
 function isGroupLoadingSuspended() {
@@ -1345,11 +1426,225 @@ function compareGroupOptions(a, b, order = "desc") {
   return 0;
 }
 
-function navigateToTopGroup(topKey) {
+function isGroupPlaceholderComplete(groupState) {
+  if (!groupState) {
+    return false;
+  }
+  const total = Number.isFinite(groupState.total) ? Math.max(0, groupState.total) : 0;
+  const count = Number.isFinite(groupState.placeholderCount) ? Math.max(0, groupState.placeholderCount) : 0;
+  return total === 0 || count >= total;
+}
+
+function updateTopGroupPlaceholderStatus(topKey) {
   if (!topKey) {
     return;
   }
+  const meta = state.topGroupStatus.get(topKey);
+  if (!meta || !meta.section) {
+    return;
+  }
+  const totalGroups = Array.isArray(meta.subgroups) ? meta.subgroups.length : 0;
+  let completeGroups = 0;
+  if (Array.isArray(meta.subgroups)) {
+    meta.subgroups.forEach((subgroup) => {
+      const groupState = subgroup && subgroup.key ? state.groups.get(subgroup.key) : null;
+      if (isGroupPlaceholderComplete(groupState)) {
+        completeGroups += 1;
+      }
+    });
+  }
+  meta.section.dataset.placeholderGroupsTotal = String(totalGroups);
+  meta.section.dataset.placeholderGroupsComplete = String(completeGroups);
+  meta.section.dataset.placeholdersComplete = completeGroups >= totalGroups ? "true" : "false";
+}
+
+function updateGroupPlaceholderStatus(groupState) {
+  if (!groupState || !groupState.container) {
+    return;
+  }
+  groupState.placeholderComplete = isGroupPlaceholderComplete(groupState);
+  groupState.container.dataset.placeholderCount = String(groupState.placeholderCount || 0);
+  groupState.container.dataset.placeholderTotal = String(groupState.total || 0);
+  groupState.container.dataset.placeholdersComplete = groupState.placeholderComplete ? "true" : "false";
+  updateTopGroupPlaceholderStatus(groupState.topKey);
+}
+
+function getCurrentTopGroupIndex() {
+  if (!elements.timeline || !elements.timelineSections || !state.topGroups.length) {
+    return 0;
+  }
+  const timelineRect = elements.timeline.getBoundingClientRect();
+  const sections = Array.from(elements.timelineSections.querySelectorAll(".top-group[data-top-key]"));
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  sections.forEach((section) => {
+    const topKey = section.dataset.topKey;
+    if (!topKey) {
+      return;
+    }
+    const candidateIndex = state.topGroups.findIndex((group) => group && group.key === topKey);
+    if (candidateIndex === -1) {
+      return;
+    }
+    const rect = section.getBoundingClientRect();
+    if (rect.bottom < timelineRect.top) {
+      return;
+    }
+    const distance = Math.abs(rect.top - timelineRect.top);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = candidateIndex;
+    }
+  });
+  return bestIndex;
+}
+
+async function hydrateTopGroupRangeForYearJump(startIndex, endIndex) {
+  if (!Number.isInteger(startIndex) || !Number.isInteger(endIndex) || !state.topGroups.length) {
+    return;
+  }
+  const tracker = createYearJumpProgressTracker(startIndex, endIndex);
+  const { lower, upper } = tracker;
+  let lastProgressUpdateAt = 0;
+  const rangeGroupKeys = [];
+  for (let topIndex = lower; topIndex <= upper; topIndex += 1) {
+    const topGroup = state.topGroups[topIndex];
+    const subgroups = Array.isArray(topGroup && topGroup.subgroups) ? topGroup.subgroups : [];
+    for (let subgroupIndex = 0; subgroupIndex < subgroups.length; subgroupIndex += 1) {
+      const subgroup = subgroups[subgroupIndex];
+      if (!subgroup || !subgroup.key) {
+        continue;
+      }
+      const subgroupTotal = Math.max(0, Number.isFinite(subgroup.count) ? subgroup.count : 0);
+      if (subgroupTotal <= 0) {
+        continue;
+      }
+      rangeGroupKeys.push(subgroup.key);
+    }
+  }
+
+  const maybeUpdateProgress = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastProgressUpdateAt < getPreallocProgressUpdateIntervalMs()) {
+      return;
+    }
+    updatePreallocationProgress(
+      tracker.currentTotal,
+      tracker.targetTotal,
+      "Pre-allocating placeholders for year jump",
+    );
+    lastProgressUpdateAt = now;
+  };
+
+  maybeUpdateProgress(true);
+  let batchByGroup = {};
+  if (rangeGroupKeys.length) {
+    try {
+      batchByGroup = await fetchGroupImagesBatch(rangeGroupKeys, { order: state.order });
+    } catch (error) {
+      console.warn("Failed to fetch grouped year-jump batch; falling back to per-group requests", error);
+      batchByGroup = {};
+    }
+  }
+
+  for (let index = lower; index <= upper; index += 1) {
+    const topGroup = state.topGroups[index];
+    if (!topGroup || !topGroup.key) {
+      continue;
+    }
+    ensureTopGroupRendered(topGroup.key);
+    const meta = state.topGroupStatus.get(topGroup.key);
+    if (!meta) {
+      continue;
+    }
+    while (meta.rendered < meta.subgroups.length) {
+      renderNextSubgroups(meta, SUBGROUP_BATCH_SIZE);
+    }
+    for (let subIndex = 0; subIndex < meta.subgroups.length; subIndex += 1) {
+      const subgroup = meta.subgroups[subIndex];
+      if (!subgroup || !subgroup.key) {
+        continue;
+      }
+      const groupState = state.groups.get(subgroup.key);
+      if (!groupState || groupState.total === 0) {
+        continue;
+      }
+      const subgroupTarget = Math.max(
+        0,
+        tracker.perGroupTotals.has(subgroup.key)
+          ? tracker.perGroupTotals.get(subgroup.key)
+          : (Number.isFinite(subgroup.count) ? subgroup.count : groupState.total),
+      );
+      const batchImages = batchByGroup && Array.isArray(batchByGroup[subgroup.key]) ? batchByGroup[subgroup.key] : null;
+      if (batchImages && batchImages.length) {
+        groupState.manifest = [];
+        state.imagesByGroup.set(groupState.key, groupState.manifest);
+        appendGroupImages(groupState, batchImages);
+        state.imagesByGroup.set(groupState.key, groupState.manifest);
+        groupState.nextCursor = null;
+        groupState.fullyLoaded = groupState.manifest.length >= groupState.total;
+      }
+      let subgroupProgress = Math.min(
+        subgroupTarget,
+        Math.max(0, Number.isFinite(groupState.placeholderCount) ? groupState.placeholderCount : 0),
+      );
+      if (!groupState.fullyLoaded || (groupState.manifest || []).length < groupState.total) {
+        await ensureGroupManifestCount(groupState, groupState.total, { force: true });
+      }
+      ensureGroupPlaceholderCount(groupState, groupState.total);
+      while ((groupState.hydratedCount || 0) < (groupState.manifest || []).length) {
+        const before = groupState.hydratedCount || 0;
+        renderNextThumbnails(groupState, Math.max(THUMBNAILS_PER_GROUP, groupState.total));
+        const afterProgress = Math.min(
+          subgroupTarget,
+          Math.max(0, Number.isFinite(groupState.placeholderCount) ? groupState.placeholderCount : 0),
+        );
+        if (afterProgress > subgroupProgress) {
+          tracker.currentTotal = Math.min(tracker.targetTotal, tracker.currentTotal + (afterProgress - subgroupProgress));
+          subgroupProgress = afterProgress;
+        }
+        maybeUpdateProgress(false);
+        if ((groupState.hydratedCount || 0) <= before) {
+          break;
+        }
+        maybeUpdateProgress(false);
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+      const after = Math.min(
+        subgroupTarget,
+        Math.max(0, Number.isFinite(groupState.placeholderCount) ? groupState.placeholderCount : 0),
+      );
+      if (after > subgroupProgress) {
+        tracker.currentTotal = Math.min(tracker.targetTotal, tracker.currentTotal + (after - subgroupProgress));
+        subgroupProgress = after;
+      }
+      maybeUpdateProgress(false);
+    }
+    // Yield once per top group to avoid long uninterrupted main-thread work.
+    maybeUpdateProgress(false);
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+  maybeUpdateProgress(true);
+}
+
+async function navigateToTopGroup(topKey) {
+  if (!topKey) {
+    return;
+  }
+  const targetIndex = state.topGroups.findIndex((group) => group && group.key === topKey);
+  if (targetIndex === -1) {
+    return;
+  }
+  const currentIndex = getCurrentTopGroupIndex();
+  setGlobalLoaderVisible(false);
+  setPreallocationOverlayVisible(true);
+  try {
+    await hydrateTopGroupRangeForYearJump(currentIndex, targetIndex);
+  } finally {
+    setPreallocationOverlayVisible(false);
+  }
   ensureTopGroupRendered(topKey);
+  await new Promise((resolve) => requestAnimationFrame(resolve));
   requestAnimationFrame(() => {
     const selector = `.top-group[data-top-key="${CSS.escape(topKey)}"]`;
     const section = document.querySelector(selector);
@@ -1402,6 +1697,31 @@ async function fetchGroupImages(groupKey, { cursor = null, limit = THUMBNAILS_PE
     params.set("cursor", cursor);
   }
   return fetchJson(`/api/group-images?${params.toString()}`);
+}
+
+async function fetchGroupImagesBatch(groupKeys, { order = state.order } = {}) {
+  const prepared = Array.from(new Set((Array.isArray(groupKeys) ? groupKeys : [])
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean)));
+  if (!prepared.length) {
+    return {};
+  }
+  const response = await fetch("/api/group-images-batch", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      groups: prepared,
+      order: order === "asc" ? "asc" : "desc",
+    }),
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `Failed to fetch group images batch (${response.status})`);
+  }
+  const payload = await response.json();
+  return payload && payload.groups && typeof payload.groups === "object" ? payload.groups : {};
 }
 
 function appendGroupImages(groupState, images) {
@@ -2961,6 +3281,7 @@ function resetStateForOrder() {
     specificMap: new Map(),
     specificList: [],
   };
+  state.startupPlaceholderBudgetRemaining = INITIAL_PLACEHOLDER_BUDGET;
   elements.timelineSections.innerHTML = "";
   if (elements.yearNavigationButtons) {
     elements.yearNavigationButtons.innerHTML = "";
@@ -3029,6 +3350,9 @@ function buildTopGroup(topGroup) {
   const section = document.createElement("section");
   section.className = "top-group";
   section.dataset.topKey = topGroup.key;
+  section.dataset.placeholdersComplete = "false";
+  section.dataset.placeholderGroupsComplete = "0";
+  section.dataset.placeholderGroupsTotal = String(Array.isArray(topGroup.subgroups) ? topGroup.subgroups.length : 0);
 
   const heading = document.createElement("h2");
   heading.textContent = topGroup.formattedLabel || topGroup.label;
@@ -3163,9 +3487,10 @@ function createSubgroup(topGroup, subgroup) {
     grid,
     manifest,
     images: [],
-    renderedCount: 0,
+    placeholderCount: 0,
     hydratedCount: 0,
     pendingHydration: totalCount > 0,
+    placeholderComplete: totalCount === 0,
     selectedCount: existingSelected,
     nextCursor: null,
     loading: null,
@@ -3174,6 +3499,7 @@ function createSubgroup(topGroup, subgroup) {
 
   state.groups.set(subgroup.key, groupState);
   state.groupSequence.push(subgroup.key);
+  updateGroupPlaceholderStatus(groupState);
 
   if (groupState.selectButton) {
     groupState.selectButton.addEventListener("click", async () => {
@@ -3200,6 +3526,35 @@ function updateGroupIndexMap() {
 }
 
 function createThumbnailPlaceholderEntry(groupState, index, meta = {}) {
+  const slot = document.createElement("div");
+  slot.className = "thumbnail-slot placeholder";
+  slot.dataset.groupKey = groupState.key;
+  slot.dataset.index = String(index);
+  if (meta.path) {
+    slot.dataset.path = meta.path;
+  }
+
+  return {
+    name: typeof meta.name === "string" ? meta.name : `Image ${index + 1}`,
+    path: typeof meta.path === "string" ? meta.path : null,
+    dateHint: meta.dateHint || null,
+    element: slot,
+    interactive: false,
+    loaded: false,
+    loading: false,
+  };
+}
+
+function hydrateThumbnailInteractiveElement(groupState, index) {
+  const entry = groupState.images[index];
+  if (!entry || !entry.element) {
+    return null;
+  }
+  if (entry.interactive && entry.element.tagName === "BUTTON") {
+    return entry.element;
+  }
+
+  const existingElement = entry.element;
   const button = document.createElement("button");
   button.type = "button";
   button.className = "thumbnail-button placeholder";
@@ -3210,15 +3565,14 @@ function createThumbnailPlaceholderEntry(groupState, index, meta = {}) {
   button.setAttribute("aria-checked", "false");
   button.dataset.groupKey = groupState.key;
   button.dataset.index = String(index);
-  if (meta.path) {
-    button.dataset.path = meta.path;
+  if (entry.path) {
+    button.dataset.path = entry.path;
   }
 
   button.addEventListener("click", (event) => {
     handleThumbnailClick(event, groupState.key, index);
   });
 
-  let entryRef = null;
   const indicator = document.createElement("span");
   indicator.className = "thumbnail-select-indicator";
   indicator.setAttribute("role", "checkbox");
@@ -3228,19 +3582,19 @@ function createThumbnailPlaceholderEntry(groupState, index, meta = {}) {
   indicator.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    if (!entryRef || !entryRef.path || state.download.inProgress) {
+    if (!entry.path || state.download.inProgress) {
       return;
     }
-    toggleImageSelection(entryRef.path, groupState.key);
+    toggleImageSelection(entry.path, groupState.key);
   });
   indicator.addEventListener("keydown", (event) => {
     if (event.key === " " || event.key === "Enter") {
       event.preventDefault();
       event.stopPropagation();
-      if (!entryRef || !entryRef.path || state.download.inProgress) {
+      if (!entry.path || state.download.inProgress) {
         return;
       }
-      toggleImageSelection(entryRef.path, groupState.key);
+      toggleImageSelection(entry.path, groupState.key);
     }
   });
   button.appendChild(indicator);
@@ -3253,29 +3607,36 @@ function createThumbnailPlaceholderEntry(groupState, index, meta = {}) {
   caption.className = "thumbnail-caption placeholder";
   button.appendChild(caption);
 
-  const entry = {
-    name: typeof meta.name === "string" ? meta.name : `Image ${index + 1}`,
-    path: typeof meta.path === "string" ? meta.path : null,
-    dateHint: meta.dateHint || null,
-    element: button,
-    loaded: false,
-    loading: false,
-  };
-  entryRef = entry;
-  return entry;
+  if (existingElement.isConnected) {
+    existingElement.replaceWith(button);
+  }
+  entry.element = button;
+  entry.interactive = true;
+  if (entry.path && state.download.items.has(entry.path)) {
+    setThumbnailSelectionState(button, true);
+  }
+  return button;
 }
 
-function renderInitialGroupPlaceholders(groupState) {
-  if (!groupState || !groupState.grid || groupState.renderedCount > 0) {
+function ensureGroupPlaceholderCount(groupState, minCount = THUMBNAILS_PER_GROUP) {
+  if (!groupState || !groupState.grid) {
     return;
   }
   const total = Number.isFinite(groupState.total) ? Math.max(0, groupState.total) : 0;
   if (total === 0) {
     return;
   }
+  const target = Math.min(total, Math.max(0, minCount));
+  const start = Number.isFinite(groupState.placeholderCount) ? groupState.placeholderCount : 0;
+  if (target <= start) {
+    return;
+  }
   const fragment = document.createDocumentFragment();
   const manifest = Array.isArray(groupState.manifest) ? groupState.manifest : [];
-  for (let index = 0; index < total; index += 1) {
+  for (let index = start; index < target; index += 1) {
+    if (groupState.images[index] && groupState.images[index].element) {
+      continue;
+    }
     const meta = manifest[index] || {};
     const entry = createThumbnailPlaceholderEntry(groupState, index, meta);
     groupState.images[index] = entry;
@@ -3287,12 +3648,32 @@ function renderInitialGroupPlaceholders(groupState) {
     }
     fragment.appendChild(entry.element);
   }
-  groupState.grid.appendChild(fragment);
-  groupState.renderedCount = total;
-  if (groupState.pendingHydration) {
+  if (fragment.childNodes.length) {
+    groupState.grid.appendChild(fragment);
+  }
+  groupState.placeholderCount = Math.max(start, target);
+  if (groupState.pendingHydration && groupState.placeholderCount > 0) {
     groupState.pendingHydration = false;
     groupState.container.classList.remove("pending-hydration");
   }
+  updateGroupPlaceholderStatus(groupState);
+}
+
+function renderInitialGroupPlaceholders(groupState) {
+  if (!groupState || !groupState.grid || groupState.placeholderCount > 0) {
+    return;
+  }
+  const total = Number.isFinite(groupState.total) ? Math.max(0, groupState.total) : 0;
+  if (total === 0) {
+    return;
+  }
+  const remainingBudget = Math.max(0, Number(state.startupPlaceholderBudgetRemaining) || 0);
+  if (remainingBudget <= 0) {
+    return;
+  }
+  const initialCount = Math.min(total, INITIAL_PLACEHOLDERS_PER_GROUP, remainingBudget);
+  ensureGroupPlaceholderCount(groupState, initialCount);
+  state.startupPlaceholderBudgetRemaining = Math.max(0, remainingBudget - initialCount);
 }
 
 function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
@@ -3309,6 +3690,7 @@ function renderNextThumbnails(groupState, batchSize = THUMBNAILS_PER_GROUP) {
     return;
   }
   const endIndex = Math.min(manifest.length, startIndex + batchSize);
+  ensureGroupPlaceholderCount(groupState, endIndex);
 
   for (let index = startIndex; index < endIndex; index += 1) {
     const meta = manifest[index] || {};
@@ -3540,7 +3922,7 @@ function loadImageEntry(groupState, index) {
   if (!entry.path) {
     return;
   }
-  const button = entry.element;
+  const button = hydrateThumbnailInteractiveElement(groupState, index);
   if (!button) {
     return;
   }
@@ -3606,6 +3988,7 @@ async function ensureGroupLoaded(groupKey, options = {}) {
   }
   const desiredCount = Math.max(options.minCount || THUMBNAILS_PER_GROUP, THUMBNAILS_PER_GROUP);
   await ensureGroupManifestCount(groupState, desiredCount, { force });
+  ensureGroupPlaceholderCount(groupState, desiredCount);
   if ((groupState.hydratedCount || 0) < groupState.manifest.length) {
     renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
   }
@@ -3721,8 +4104,13 @@ async function ensureImageLoaded(path, groupKey) {
   if (targetIndex === -1) {
     return -1;
   }
-  while (groupState.renderedCount <= targetIndex) {
+  ensureGroupPlaceholderCount(groupState, targetIndex + 1);
+  while ((groupState.hydratedCount || 0) <= targetIndex) {
+    const before = groupState.hydratedCount || 0;
     renderNextThumbnails(groupState, THUMBNAILS_PER_GROUP);
+    if ((groupState.hydratedCount || 0) <= before) {
+      break;
+    }
   }
   const resolved = state.pathToImage.get(path);
   return resolved && resolved.groupKey === groupKey ? resolved.index : targetIndex;
@@ -5008,9 +5396,7 @@ if (elements.yearNavigationButtons) {
     const topKey = target.dataset.topKey;
     showTimelineView();
     closeControlPanel();
-    requestAnimationFrame(() => {
-      navigateToTopGroup(topKey);
-    });
+    navigateToTopGroup(topKey).catch((error) => console.error(error));
   });
 }
 
@@ -5021,9 +5407,7 @@ if (elements.yearNavigationSelect) {
       return;
     }
     showTimelineView();
-    requestAnimationFrame(() => {
-      navigateToTopGroup(topKey);
-    });
+    navigateToTopGroup(topKey).catch((error) => console.error(error));
     event.target.selectedIndex = 0;
     closeControlPanel();
   });

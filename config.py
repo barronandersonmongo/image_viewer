@@ -15,7 +15,7 @@ THUMBNAIL_PLACEHOLDER_PATH = STATIC_DIR / "thumbnail-placeholder.svg"
 # Defaults
 BIND_IP = "0.0.0.0"
 PORT = 8080
-IMAGE_PATH_ROOT = Path("/home/barry/bobby/pictures")
+IMAGE_PATH_ROOT = Path("/barry_shares/pictures")
 MONGO_URI = "mongodb://barry:barry@192.168.1.9:27017/"
 MONGO_DB = "barrydb"
 MONGO_COLLECTION = "images"
@@ -26,6 +26,7 @@ THUMBNAIL_SIZE = 320
 IMAGE_CACHE_TTL_SECONDS = 30
 EXIF_CACHE_TTL_SECONDS = 300
 SEMANTIC_SCORE_DEFAULT = 0.75
+PREALLOC_PROGRESS_UPDATE_INTERVAL_MS = 1000
 
 # Logging defaults
 LOG_LEVEL = "INFO"
@@ -53,6 +54,7 @@ class AppConfig:
     root: Path = IMAGE_PATH_ROOT
     thumbnail_size: int = THUMBNAIL_SIZE
     semantic_score_default: float = SEMANTIC_SCORE_DEFAULT
+    prealloc_progress_update_interval_ms: int = PREALLOC_PROGRESS_UPDATE_INTERVAL_MS
     mongo: Optional[MongoConfig] = None
     voyage_api_key: str = VOYAGE_API_KEY
     voyage_model: str = VOYAGE_EMBEDDING_MODEL

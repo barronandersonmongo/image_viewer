@@ -40,6 +40,7 @@ from config import (
     MONGO_HOLIDAY_COLLECTION,
     MONGO_URI,
     SEMANTIC_SCORE_DEFAULT,
+    PREALLOC_PROGRESS_UPDATE_INTERVAL_MS,
     VOYAGE_API_KEY,
     VOYAGE_EMBEDDING_MODEL,
     STATIC_DIR,
@@ -240,6 +241,9 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/download":
             self.api_download()
+            return
+        if parsed.path == "/api/group-images-batch":
+            self.api_group_images_batch()
             return
         if parsed.path == "/api/images-by-dates":
             self.api_images_by_dates()
@@ -537,7 +541,10 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_json({"results": results})
 
     def api_config(self) -> None:
-        payload = {"semantic_score_default": self.config.semantic_score_default}
+        payload = {
+            "semantic_score_default": self.config.semantic_score_default,
+            "prealloc_progress_update_interval_ms": self.config.prealloc_progress_update_interval_ms,
+        }
         LOGGER.info("HTTP response", extra={"route": "/api/config"})
         self.send_json(payload)
 
@@ -743,6 +750,58 @@ class ImageRequestHandler(http.server.SimpleHTTPRequestHandler):
         )
         self.send_json(payload)
 
+    def api_group_images_batch(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self.send_json({"error": "Invalid Content-Length"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if length <= 0:
+            self.send_json({"error": "Missing request body"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            payload_raw = self.rfile.read(length)
+            payload = json.loads(payload_raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json({"error": "Invalid JSON payload"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if not isinstance(payload, dict):
+            self.send_json({"error": "Payload must be an object"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        groups_input = payload.get("groups")
+        if not isinstance(groups_input, list):
+            self.send_json({"error": "'groups' must be an array"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        cleaned_groups: List[str] = []
+        seen = set()
+        for item in groups_input:
+            group_key = str(item).replace("\\", "/").strip() if item is not None else ""
+            if not group_key or group_key in seen:
+                continue
+            seen.add(group_key)
+            cleaned_groups.append(group_key)
+            if len(cleaned_groups) >= 1000:
+                break
+        if not cleaned_groups:
+            self.send_json({"groups": {}, "order": "desc"})
+            return
+        order = str(payload.get("order") or "desc").lower()
+        response_payload = self.hierarchy_service.group_images_batch_payload(
+            self.root_path,
+            cleaned_groups,
+            order,
+        )
+        LOGGER.info(
+            "HTTP response",
+            extra={
+                "route": "/api/group-images-batch",
+                "order": order,
+                "groups_count": len(cleaned_groups),
+                "returned_groups_count": len(response_payload.get("groups", {})),
+            },
+        )
+        self.send_json(response_payload)
+
     def api_random_pool(self, params: Dict[str, List[str]]) -> None:
         start = params.get("start", [None])[0]
         end = params.get("end", [None])[0]
@@ -868,6 +927,7 @@ def build_config() -> AppConfig:
         root=root_path,
         thumbnail_size=THUMBNAIL_SIZE,
         semantic_score_default=SEMANTIC_SCORE_DEFAULT,
+        prealloc_progress_update_interval_ms=PREALLOC_PROGRESS_UPDATE_INTERVAL_MS,
         mongo=MongoConfig(
             uri=MONGO_URI,
             database=MONGO_DB,
