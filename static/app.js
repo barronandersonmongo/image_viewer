@@ -1075,6 +1075,9 @@ function showVectorResultsView(results, query) {
   }
   updateVectorSortButtons();
   renderVectorResultsGrid();
+  if (elements.timeline) {
+    elements.timeline.scrollTop = 0;
+  }
   updateSemanticReturnControl();
 }
 
@@ -3142,6 +3145,7 @@ function openControlPanel() {
   if (!elements.header || !elements.controlContent) {
     return;
   }
+  clearHeaderHideTimer();
   elements.header.classList.remove("viewer-hidden");
   if (state.controlOpen) {
     elements.controlContent.setAttribute("aria-hidden", "false");
@@ -3204,6 +3208,7 @@ function closeControlPanel() {
   if (!state.controlOpen || !elements.header || !elements.controlContent) {
     return;
   }
+  clearHeaderHideTimer();
   if (state.flyoutPinned) {
     return;
   }
@@ -4427,7 +4432,12 @@ function openVectorViewerAt(index) {
   elements.viewerOverlay.hidden = false;
   document.body.classList.add("viewer-open");
   if (elements.header) {
-    elements.header.classList.add("viewer-hidden");
+    if (state.flyoutPinned || state.controlOpen) {
+      elements.header.classList.remove("viewer-hidden");
+      setHeaderCollapsed(false);
+    } else {
+      elements.header.classList.add("viewer-hidden");
+    }
   }
   applyViewerModePresentation();
   const blendDuration = Math.max(0, Number(state.viewer.pendingBlend) || 0);
@@ -4911,6 +4921,9 @@ function handleViewerDoubleClick(event) {
 }
 
 function handleViewerContainerClick(event) {
+  if (state.controlOpen) {
+    return;
+  }
   if (!state.viewer.detailsOpen) {
     return;
   }
@@ -5182,6 +5195,9 @@ async function handleSearch(event) {
   if (!rawQuery) {
     closeControlPanel();
     return;
+  }
+  if (state.viewer.open) {
+    closeViewer();
   }
   try {
     const results = await fetchVectorSearch(rawQuery, { limit: 30, candidates: 200 });
@@ -5504,9 +5520,23 @@ if (Array.isArray(elements.controlTabButtons) && elements.controlTabButtons.leng
   elements.controlTabButtons.forEach((button) => {
     button.addEventListener("click", (event) => {
       event.preventDefault();
+      event.stopPropagation();
       const tab = button.dataset.tab;
+      if (!state.controlOpen) {
+        openControlPanel();
+      }
       setActiveControlTab(tab);
+      setHeaderCollapsed(false);
     });
+  });
+}
+
+if (elements.controlContent) {
+  elements.controlContent.addEventListener("pointerdown", (event) => {
+    event.stopPropagation();
+  });
+  elements.controlContent.addEventListener("click", (event) => {
+    event.stopPropagation();
   });
 }
 
@@ -5750,6 +5780,9 @@ function setupViewerGestures() {
     if (!state.viewer.open) {
       return;
     }
+    if (state.controlOpen) {
+      return;
+    }
     if (!isViewerDetailsEnabledForMode()) {
       return;
     }
@@ -5813,10 +5846,14 @@ function setHeaderCollapsed(collapsed) {
     elements.header.classList.add('collapsed');
     elements.header.classList.remove('expanded');
     elements.header.classList.remove('show');
+    if (state.viewer.open && !state.controlOpen && !state.flyoutPinned) {
+      elements.header.classList.add("viewer-hidden");
+    }
   } else {
     elements.header.classList.remove('collapsed');
     elements.header.classList.add('expanded');
     elements.header.classList.add('show');
+    elements.header.classList.remove("viewer-hidden");
   }
   updateFlyoutHandleState(!collapsed);
   updateFlyoutBackdropState();
@@ -5825,6 +5862,33 @@ function setHeaderCollapsed(collapsed) {
 let headerHover = false;
 let headerShownRecently = false;
 let suppressHeaderAutoRevealUntil = 0;
+let lastPointerDownInsideFlyout = false;
+let headerHideTimer = null;
+
+function clearHeaderHideTimer() {
+  if (!headerHideTimer) {
+    return;
+  }
+  clearTimeout(headerHideTimer);
+  headerHideTimer = null;
+}
+
+function scheduleHeaderHide() {
+  clearHeaderHideTimer();
+  headerHideTimer = setTimeout(() => {
+    headerHideTimer = null;
+    if (state.flyoutPinned || state.controlOpen) {
+      return;
+    }
+    const headerHovered = Boolean(elements.header && elements.header.matches(":hover"));
+    const handleHovered = Boolean(elements.flyoutHandle && elements.flyoutHandle.matches(":hover"));
+    if (headerHovered || handleHovered) {
+      return;
+    }
+    headerHover = false;
+    setHeaderCollapsed(true);
+  }, 320);
+}
 
 function suppressHeaderAutoReveal(durationMs = 900) {
   suppressHeaderAutoRevealUntil = Date.now() + Math.max(0, durationMs);
@@ -5834,6 +5898,7 @@ function showHeader() {
   if (Date.now() < suppressHeaderAutoRevealUntil) {
     return;
   }
+  clearHeaderHideTimer();
   headerHover = true;
   setHeaderCollapsed(false);
   headerShownRecently = true;
@@ -5842,23 +5907,31 @@ function showHeader() {
 function hideHeaderIfIdle(event) {
   if (event && elements.header) {
     const nextTarget = event.relatedTarget;
-    if (!nextTarget) {
-      return;
-    }
-    if (elements.header.contains(nextTarget)) {
+    if (nextTarget && (elements.header.contains(nextTarget)
+      || (elements.flyoutHandle && elements.flyoutHandle.contains(nextTarget)))) {
       return;
     }
   }
-  headerHover = false;
   if (state.flyoutPinned) {
     return;
   }
-  if (!state.controlOpen) {
-    setHeaderCollapsed(true);
+  if (state.controlOpen) {
+    return;
   }
+  scheduleHeaderHide();
 }
 
 if (elements.header) {
+  elements.header.addEventListener("pointerdown", (event) => {
+    if (state.controlOpen) {
+      event.stopPropagation();
+    }
+  });
+  elements.header.addEventListener("click", (event) => {
+    if (state.controlOpen) {
+      event.stopPropagation();
+    }
+  });
   elements.header.addEventListener("mouseenter", showHeader);
   elements.header.addEventListener("mouseleave", hideHeaderIfIdle);
   elements.header.addEventListener("focusin", showHeader);
@@ -5912,12 +5985,16 @@ if (elements.flyoutHandle) {
   });
 }
 
+document.addEventListener("pointerdown", (event) => {
+  lastPointerDownInsideFlyout = isInsideFlyout(event.target);
+}, true);
+
 document.addEventListener("click", (event) => {
   if (!elements.header) {
     return;
   }
-  const inHeader = elements.header.contains(event.target)
-    || (elements.flyoutHandle && elements.flyoutHandle.contains(event.target));
+  const inHeader = isInsideFlyout(event.target) || lastPointerDownInsideFlyout;
+  lastPointerDownInsideFlyout = false;
   if (state.controlOpen) {
     if (!inHeader && !state.flyoutPinned) {
       suppressViewerOpen();
